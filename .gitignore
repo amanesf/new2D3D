@@ -1,0 +1,15 @@
+node_modules/
+experiments/**/venv/
+experiments/**/ov_cache/
+experiments/**/ov_cache_v10/
+experiments/**/raw_models/
+experiments/**/meinamix_v10_diffusers/
+experiments/**/meinamix_v10_ov/
+experiments/**/ov_cache_v11/
+experiments/**/meinamix_v11_diffusers/
+experiments/**/meinamix_v11_ov/
+__pycache__/
+experiments/ondevice_gen_test/ov_cache*/
+experiments/ondevice_gen_test/meinamix_*_ov/
+experiments/**/sd_inpaint_diffusers/
+experiments/**/hf_cache/

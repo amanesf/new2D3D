@@ -1,0 +1,35 @@
+{
+ "size": [
+  512,
+  704
+ ],
+ "bg": "#fefeff",
+ "head": {
+  "x": 46,
+  "y": 0,
+  "w": 423,
+  "h": 374
+ },
+ "face_hole": {
+  "x": 34,
+  "y": 20,
+  "w": 352,
+  "h": 320
+ },
+ "ponytail": {
+  "x": 0,
+  "y": 33,
+  "w": 225,
+  "h": 567
+ },
+ "ponytail_anchor": {
+  "x": 170,
+  "y": 60
+ },
+ "draw_order": [
+  "base",
+  "ponytail",
+  "head",
+  "face"
+ ]
+}

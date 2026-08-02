@@ -1,0 +1,65 @@
+{
+ "overlap": 36,
+ "bands": [
+  {
+   "file": "band0.png",
+   "crop_y0": 0,
+   "w": 225,
+   "h": 210,
+   "pivot_local": {
+    "x": 148.9,
+    "y": 0
+   }
+  },
+  {
+   "file": "band1.png",
+   "crop_y0": 174,
+   "w": 225,
+   "h": 106,
+   "pivot_local": {
+    "x": 89.8,
+    "y": 36
+   }
+  },
+  {
+   "file": "band2.png",
+   "crop_y0": 244,
+   "w": 225,
+   "h": 106,
+   "pivot_local": {
+    "x": 69.1,
+    "y": 36
+   }
+  },
+  {
+   "file": "band3.png",
+   "crop_y0": 314,
+   "w": 225,
+   "h": 106,
+   "pivot_local": {
+    "x": 33.8,
+    "y": 36
+   }
+  },
+  {
+   "file": "band4.png",
+   "crop_y0": 384,
+   "w": 225,
+   "h": 106,
+   "pivot_local": {
+    "x": 27.3,
+    "y": 36
+   }
+  },
+  {
+   "file": "band5.png",
+   "crop_y0": 454,
+   "w": 225,
+   "h": 113,
+   "pivot_local": {
+    "x": 13.9,
+    "y": 36
+   }
+  }
+ ]
+}

@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Vector Puppet PoC — スーパーLive2D(パラメトリック方式)</title>
+<style>
+  html,body{margin:0;padding:0;background:#20242c;color:#dde3ec;
+    font-family:system-ui,sans-serif;touch-action:manipulation;}
+  #wrap{max-width:480px;margin:0 auto;padding:8px;}
+  canvas{width:100%;height:auto;display:block;background:#2a2f3a;border-radius:12px;}
+  .row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;}
+  .row label{font-size:12px;min-width:44px;}
+  input[type=range]{flex:1;}
+  button{background:#3a4152;color:#dde3ec;border:0;border-radius:8px;
+    padding:8px 12px;font-size:13px;}
+  button.on{background:#5b8def;}
+  #note{font-size:11px;opacity:.6;margin-top:8px;line-height:1.5;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="480" height="560"></canvas>
+  <div class="row"><label>yaw</label>
+    <input type="range" id="yaw" min="-180" max="180" value="0" step="1">
+    <span id="yawv" style="font-size:12px;width:40px;text-align:right">0°</span></div>
+  <div class="row"><label>pitch</label>
+    <input type="range" id="pitch" min="-25" max="25" value="0" step="1">
+    <span id="pitchv" style="font-size:12px;width:40px;text-align:right">0°</span></div>
+  <div class="row" id="expr">
+    <button data-e="neutral" class="on">neutral</button>
+    <button data-e="happy">happy</button>
+    <button data-e="angry">angry</button>
+    <button data-e="sad">sad</button>
+    <button data-e="surprised">surprised</button>
+  </div>
+  <div class="row">
+    <button id="spin">自動回転</button>
+    <button id="blink">まばたき</button>
+  </div>
+  <div id="note">
+    パーツ=コード(パラメトリック2.5D)。画像素材ゼロ。ツインテールは3Dスパイン+
+    画面空間リボン描画なので、どのyawでもエッジオン細りが起きない。
+    Z順は毎フレーム深度ソートで自動解決。
+  </div>
+</div>
+<script>
+"use strict";
+// ============================================================
+// Vector Puppet PoC — キャラクターを「画像」ではなく「パラメトリックな
+// 2.5Dパーツのコード」として持ち、任意のyaw/pitchでトゥーン描画する。
+// visual hull(復元)ではなく順方向レンダリングなので、ツインテールの
+// エッジオン細り問題は原理的に発生しない。
+// ============================================================
+
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+// ---- パレット(キャラ定義の一部。Claudeがテキストで調整できる) ----
+const PAL = {
+  skin:"#ffe3d0", skinShade:"#f5c3ab",
+  hair:"#7f6cf0", hairShade:"#6353c9", hairHi:"#a89bff",
+  eyeIris:"#4db3a4", eyeDark:"#1e2430",
+  cloth:"#3f4b6e", clothShade:"#333d5a", ribbon:"#ff6f9c", ribbonShade:"#e05580",
+  line:"#2b2033", blush:"#ffb3b3", mouth:"#c9506a", mouthOpen:"#8e3247",
+};
+
+// ---- 状態 ----
+const state = { yaw:0, pitch:0, t:0, expr:"neutral", blink:0, spinning:false };
+
+// ---- 3Dミニ数学(直交投影、y-down画面) ----
+const DEG = Math.PI/180;
+function rotY(p, a){ const c=Math.cos(a), s=Math.sin(a);
+  return [p[0]*c + p[2]*s, p[1], -p[0]*s + p[2]*c]; }
+function rotX(p, a){ const c=Math.cos(a), s=Math.sin(a);
+  return [p[0], p[1]*c - p[2]*s, p[1]*s + p[2]*c]; }
+// キャラ空間: 原点=首の付け根、+yが上、+zがカメラ向き。単位=px相当。
+function view(p){
+  let q = rotY(p, state.yaw*DEG);
+  q = rotX(q, -state.pitch*DEG*0.6);
+  return q;
+}
+const CX = W/2, CY = H*0.62;
+function proj(p){ const v = view(p); return {x:CX+v[0], y:CY-v[1], z:v[2]}; }
+
+// ---- 描画ヘルパ ----
+function path(pts, close){
+  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+  for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+  if(close!==false) ctx.closePath();
+}
+function smoothPath(pts, close){
+  // Catmull-Rom → ベジエでなめらかな輪郭
+  ctx.beginPath();
+  const n = pts.length;
+  ctx.moveTo(pts[0].x, pts[0].y);
+  const wrap = close!==false;
+  const last = wrap? n : n-1;
+  for(let i=0;i<last;i++){
+    const p0 = pts[(i-1+n)%n], p1 = pts[i], p2 = pts[(i+1)%n], p3 = pts[(i+2)%n];
+    const c1 = {x:p1.x+(p2.x-p0.x)/6, y:p1.y+(p2.y-p0.y)/6};
+    const c2 = {x:p2.x-(p3.x-p1.x)/6, y:p2.y-(p3.y-p1.y)/6};
+    ctx.bezierCurveTo(c1.x,c1.y,c2.x,c2.y,p2.x,p2.y);
+  }
+  if(wrap) ctx.closePath();
+}
+function fillStroke(fill, lw){
+  ctx.fillStyle = fill; ctx.fill();
+  if(lw){ ctx.strokeStyle = PAL.line; ctx.lineWidth = lw;
+    ctx.lineJoin="round"; ctx.lineCap="round"; ctx.stroke(); }
+}
+
+// ---- リボン(チューブ)描画: 3Dスパイン → 投影 → 画面空間で幅オフセット。
+// チューブ半径を画面上でそのまま幅として使うので、視線方向に伸びる区間でも
+// 幅がゼロに潰れない(=エッジオン細りの構造的回避)。 ----
+function ribbonOutline(spine3d, widths){
+  const pts = spine3d.map(proj);
+  const L=[], R=[];
+  for(let i=0;i<pts.length;i++){
+    const a = pts[Math.max(0,i-1)], b = pts[Math.min(pts.length-1,i+1)];
+    let dx=b.x-a.x, dy=b.y-a.y; const len=Math.hypot(dx,dy)||1;
+    dx/=len; dy/=len;
+    const w = widths[i];
+    L.push({x:pts[i].x-dy*w, y:pts[i].y+dx*w});
+    R.push({x:pts[i].x+dy*w, y:pts[i].y-dx*w});
+  }
+  return {outline:L.concat(R.reverse()), pts};
+}
+function drawRibbon(spine3d, widths, fill, shade){
+  const {outline} = ribbonOutline(spine3d, widths);
+  smoothPath(outline);
+  fillStroke(fill, 3);
+  if(shade){
+    ctx.save(); smoothPath(outline); ctx.clip();
+    ctx.translate(6,5); smoothPath(outline);
+    ctx.fillStyle=shade; ctx.globalAlpha=.55; ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---- 頭部の球ヘルパ ----
+const HEAD = { c:[0,118,0], r:78 };
+function onHead(azimuthDeg, elevDeg, out=1){
+  // 頭球面上の点(キャラ空間)。azimuth 0=正面。
+  const a=azimuthDeg*DEG, e=elevDeg*DEG, r=HEAD.r*out;
+  return [ r*Math.cos(e)*Math.sin(a),
+           HEAD.c[1] + r*Math.sin(e),
+           r*Math.cos(e)*Math.cos(a) ];
+}
+// 顔カードの可視係数: カメラ向き成分(z)を正規化
+function facing(azimuthDeg, elevDeg){
+  const v = view(onHead(azimuthDeg, elevDeg));
+  return (v[2]) / HEAD.r; // 1=真正面, 0=真横, <0=裏
+}
+
+// ---- 表情(VRMプリセット互換のキー形状パラメータ) ----
+const EXPR = {
+  neutral:  {eyeOpen:1, eyeCurve:0,  browY:0,  browTilt:0,  mouth:"idle",  blush:0},
+  happy:    {eyeOpen:.15,eyeCurve:1, browY:-2, browTilt:-6, mouth:"smile", blush:.8},
+  angry:    {eyeOpen:.8, eyeCurve:0, browY:6,  browTilt:14, mouth:"frown", blush:0},
+  sad:      {eyeOpen:.55,eyeCurve:0, browY:2,  browTilt:-12,mouth:"frown", blush:.3},
+  surprised:{eyeOpen:1.25,eyeCurve:0,browY:-8, browTilt:0,  mouth:"open",  blush:.2},
+};
+
+// ============================================================
+// パーツ定義: 各パーツは {depth(), draw()} を持ち、毎フレーム深度ソート。
+// ============================================================
+const parts = [];
+function addPart(name, depthFn, drawFn){ parts.push({name, depthFn, drawFn}); }
+
+// ---- 後ろ髪(頭の背面に貼り付くボリューム。背面視では頭全体を覆う) ----
+addPart("backHair",
+  () => view(onHead(180,0))[2] - 5,
+  () => {
+    const c = proj(HEAD.c);
+    const behind = Math.cos(state.yaw*DEG) > 0; // 頭の後ろに隠れている状態
+    const spread = 1.1;
+    const pts=[];
+    // 頭頂を含む全周弧(画面空間の扇形)
+    for(let i=0;i<=12;i++){
+      const a = -108 + i*18;
+      const rad = HEAD.r*spread + 8*Math.sin(i*2.1+1);
+      pts.push({x:c.x + rad*Math.sin(a*DEG), y:c.y - rad*Math.cos(a*DEG)});
+    }
+    // 裾(毛先のギザギザ)
+    pts.push({x:c.x+HEAD.r*.72, y:c.y+HEAD.r*1.32});
+    pts.push({x:c.x+HEAD.r*.3,  y:c.y+HEAD.r*1.12});
+    pts.push({x:c.x,            y:c.y+HEAD.r*1.36});
+    pts.push({x:c.x-HEAD.r*.3,  y:c.y+HEAD.r*1.12});
+    pts.push({x:c.x-HEAD.r*.72, y:c.y+HEAD.r*1.32});
+    smoothPath(pts); fillStroke(behind? PAL.hairShade : PAL.hair, 3);
+    if(!behind){
+      // 背面視: ハイライト(天使の輪)と落ち影で立体感
+      ctx.save(); smoothPath(pts); ctx.clip();
+      ctx.beginPath();
+      ctx.ellipse(c.x, c.y-HEAD.r*.42, HEAD.r*.66, 13, 0, 0, 7);
+      ctx.strokeStyle=PAL.hairHi; ctx.lineWidth=7; ctx.globalAlpha=.75; ctx.stroke();
+      ctx.globalAlpha=1; ctx.restore();
+    }
+  });
+
+// ---- ツインテール(左右)。3Dスパイン+揺れ(ばね近似) ----
+function twintailSpine(side){ // side=+1 右, -1 左
+  const base = onHead(side*118, 28, 1.02);
+  const sway = Math.sin(state.t*1.7 + side)*10 + Math.sin(state.t*2.9)*4;
+  const n = 9, pts=[];
+  for(let i=0;i<n;i++){
+    const u = i/(n-1);
+    const droop = u*u*185;
+    const flare = Math.sin(u*Math.PI)*30;
+    pts.push([ base[0] + side*(18 + flare*.9) + sway*u*side*.35,
+               base[1] + 12 - droop + Math.sin(u*6+state.t*2)*3,
+               base[2] - 14 - u*26 + sway*u*.5 ]);
+  }
+  return pts;
+}
+const TT_W = [16,22,26,27,25,21,16,10,3];
+for(const side of [1,-1]){
+  addPart("twintail"+(side>0?"R":"L"),
+    () => { const s=twintailSpine(side);
+      return s.map(p=>view(p)[2]).reduce((a,b)=>a+b)/s.length; },
+    () => {
+      drawRibbon(twintailSpine(side), TT_W, PAL.hair, PAL.hairShade);
+      // 房のハイライト
+      const s = twintailSpine(side).slice(1,5);
+      const {outline} = ribbonOutline(s, [8,11,12,9]);
+      smoothPath(outline); ctx.fillStyle=PAL.hairHi; ctx.globalAlpha=.7;
+      ctx.fill(); ctx.globalAlpha=1;
+    });
+  // 結びリボン
+  addPart("ttRibbon"+(side>0?"R":"L"),
+    () => view(onHead(side*118, 30, 1.05))[2] + 2,
+    () => {
+      const p = proj(onHead(side*118, 30, 1.08));
+      ctx.save(); ctx.translate(p.x, p.y);
+      for(const dir of [-1,1]){
+        path([{x:0,y:0},{x:dir*22,y:-13},{x:dir*24,y:6},{x:0,y:6}]);
+        fillStroke(PAL.ribbon, 2.5);
+      }
+      ctx.beginPath(); ctx.arc(0,0,7,0,7); fillStroke(PAL.ribbonShade, 2.5);
+      ctx.restore();
+    });
+}
+
+// ---- 体(簡易ボリューム: 首+胴+スカート+腕) ----
+addPart("body",
+  () => view([0,0,-8])[2],
+  () => {
+    const bodyYaw = state.yaw*DEG*0.55; // 体は首より緩く追従
+    const yawS = Math.sin(bodyYaw);
+    // 体の見かけ幅: 正面/背面=1、真横=0.66(前後対称、負にならない)
+    const wf = 1 - 0.34*Math.abs(yawS);
+    const bx = d => d*wf;
+    const c = proj([0,0,0]);
+    const nx = c.x + 26*yawS;
+    // スカート
+    const sk=[{x:nx-bx(44),y:c.y+66},{x:nx-bx(58),y:c.y+126},
+              {x:nx,y:c.y+134},{x:nx+bx(58),y:c.y+126},{x:nx+bx(44),y:c.y+66}];
+    smoothPath(sk); fillStroke(PAL.clothShade,3);
+    // 胴
+    const bd=[{x:nx-bx(34),y:c.y+10},{x:nx-bx(40),y:c.y+52},{x:nx-bx(44),y:c.y+78},
+              {x:nx,y:c.y+84},{x:nx+bx(44),y:c.y+78},{x:nx+bx(40),y:c.y+52},
+              {x:nx+bx(34),y:c.y+10}];
+    smoothPath(bd); fillStroke(PAL.cloth,3);
+    // 腕(左右)。実3D座標をview()に通す。体は0.55*yawしか回らないので、
+    // 差分(-0.45*yaw)を先に打ち消してから投影する。
+    const comp = -(state.yaw*DEG)*0.45;
+    for(const s of [-1,1]){
+      const spine = [[s*42,-8,-2],[s*52,-42,4],[s*47,-76,8]]
+        .map(p=>rotY(p, comp));
+      drawRibbon(spine, [11,10,8], PAL.cloth, PAL.clothShade);
+      if(Math.cos(state.yaw*DEG) > -0.2){ // 背面では手は体に隠れる
+        const hp = proj(spine[2]);
+        ctx.beginPath(); ctx.arc(hp.x,hp.y,8,0,7); fillStroke(PAL.skin,2.5);
+      }
+    }
+    // 襟元リボン(正面側のみ)
+    if(Math.cos(state.yaw*DEG) > .1){
+      ctx.save(); ctx.translate(nx, c.y+16); ctx.globalAlpha=Math.min(1,Math.cos(state.yaw*DEG)*1.4);
+      for(const dir of [-1,1]){
+        path([{x:0,y:0},{x:dir*17*wf,y:-9},{x:dir*19*wf,y:8},{x:0,y:5}]);
+        fillStroke(PAL.ribbon,2.5);
+      }
+      ctx.beginPath(); ctx.arc(0,0,5.5,0,7); fillStroke(PAL.ribbonShade,2.5);
+      ctx.restore(); ctx.globalAlpha=1;
+    }
+  });
+
+// ---- 首 ----
+addPart("neck",
+  () => view([0,40,0])[2]-2,
+  () => {
+    const a = proj([0,66,-2]), b = proj([0,20,-2]);
+    ctx.beginPath();
+    ctx.moveTo(a.x-13,a.y); ctx.lineTo(b.x-15,b.y);
+    ctx.lineTo(b.x+15,b.y); ctx.lineTo(a.x+13,a.y); ctx.closePath();
+    fillStroke(PAL.skinShade, 3);
+  });
+
+// ---- 頭(球=常に円。トゥーン影は光源方向の三日月) ----
+addPart("head",
+  () => view(HEAD.c)[2],
+  () => {
+    const c = proj(HEAD.c);
+    ctx.beginPath(); ctx.arc(c.x, c.y, HEAD.r, 0, 7);
+    fillStroke(PAL.skin, 3.5);
+    // 三日月影(画面右下固定光源の反対側)
+    ctx.save();
+    ctx.beginPath(); ctx.arc(c.x, c.y, HEAD.r, 0, 7); ctx.clip();
+    ctx.beginPath(); ctx.arc(c.x-14, c.y-10, HEAD.r*1.04, 0, 7);
+    ctx.rect(-W,-H,3*W,3*H);
+    ctx.fillStyle=PAL.skinShade; ctx.globalAlpha=.5;
+    ctx.fill("evenodd");
+    ctx.restore();
+  });
+
+// ---- 前髪(頭前面のカード群: 房のギザギザ) ----
+addPart("frontHair",
+  () => view(onHead(0,30))[2]+3,
+  () => {
+    const c = proj(HEAD.c);
+    // 前髪の生え際中心は頭球の正面上方に追従
+    const anchor = proj(onHead(0, 42, 1.02));
+    const f = facing(0,30);
+    if(f < -0.35) return; // ほぼ真後ろでは描かない
+    const spreadX = HEAD.r*1.06, topY = c.y - HEAD.r*1.02;
+    const fringe=[];
+    const n=7;
+    for(let i=0;i<=n;i++){
+      const u=i/n, x = c.x + (u-0.5)*2*spreadX*0.98;
+      const dip = (i%2===0)? 26:10;
+      fringe.push({x:x + (anchor.x-c.x)*.35, y: c.y - 38 + dip + Math.abs(u-0.5)*-16});
+    }
+    const pts = [{x:c.x-spreadX + (anchor.x-c.x)*.3, y:c.y+6},
+                 {x:c.x-spreadX*.96 + (anchor.x-c.x)*.32, y:topY+34}];
+    pts.push({x:c.x + (anchor.x-c.x)*.4, y:topY-4});
+    pts.push({x:c.x+spreadX*.96 + (anchor.x-c.x)*.32, y:topY+34});
+    pts.push({x:c.x+spreadX + (anchor.x-c.x)*.3, y:c.y+6});
+    for(let i=fringe.length-1;i>=0;i--) pts.push(fringe[i]);
+    smoothPath(pts); fillStroke(PAL.hair, 3.5);
+    // ハイライト(天使の輪)
+    ctx.save(); smoothPath(pts); ctx.clip();
+    ctx.beginPath();
+    ctx.ellipse(c.x + (anchor.x-c.x)*.4, topY+26, spreadX*.62, 12, 0, 0, 7);
+    ctx.strokeStyle=PAL.hairHi; ctx.lineWidth=7; ctx.globalAlpha=.75; ctx.stroke();
+    ctx.restore(); ctx.globalAlpha=1;
+  });
+
+// ---- 顔カード(目・眉・口・頬)。球面滑走+cos縮小+背面カリング ----
+function faceCardPos(azi, elev){
+  const p = proj(onHead(azi, elev, 1.001));
+  const f = facing(azi, elev);
+  return {p, f};
+}
+addPart("face",
+  () => view(onHead(0,0))[2]+4,
+  () => {
+    const e = EXPR[state.expr];
+    const blink = Math.max(state.blink, 1-e.eyeOpen>0.8?0:0);
+    const eyeOpen = Math.max(0.05, e.eyeOpen * (1-state.blink));
+    for(const s of [-1,1]){ // 左右の目
+      const {p,f} = faceCardPos(s*17, 6);
+      if(f<=0.32) continue; // 輪郭ぎわのリング化を避けるため早めにカリング
+      const sq = Math.max(.3, Math.min(1, f*1.2)); // 横縮小
+      const ew = 17*sq, eh = 21*eyeOpen;
+      ctx.save(); ctx.translate(p.x, p.y);
+      ctx.globalAlpha = Math.min(1, (f-0.32)*6);
+      if(e.eyeCurve>0.5 && state.blink<0.5){
+        // にっこり目(^ ^)
+        ctx.beginPath(); ctx.moveTo(-ew,4); ctx.quadraticCurveTo(0,-10,ew,4);
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=4.5; ctx.lineCap="round"; ctx.stroke();
+      } else if(eh < 4){
+        ctx.beginPath(); ctx.moveTo(-ew,0); ctx.quadraticCurveTo(0,3,ew,0);
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=4; ctx.lineCap="round"; ctx.stroke();
+      } else {
+        ctx.beginPath(); ctx.ellipse(0,0,ew,eh,0,0,7);
+        ctx.fillStyle="#fff"; ctx.fill();
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=3; ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(0,2,ew*.62,eh*.78,0,0,7);
+        ctx.fillStyle=PAL.eyeIris; ctx.fill();
+        ctx.beginPath(); ctx.ellipse(0,2,ew*.3,eh*.4,0,0,7);
+        ctx.fillStyle=PAL.eyeDark; ctx.fill();
+        ctx.beginPath(); ctx.ellipse(-ew*.2,-eh*.25,ew*.16,eh*.14,0,0,7);
+        ctx.fillStyle="#fff"; ctx.fill();
+        // 上まぶたライン
+        ctx.beginPath(); ctx.moveTo(-ew,-eh*.55);
+        ctx.quadraticCurveTo(0,-eh*1.15,ew,-eh*.55);
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=4.5; ctx.stroke();
+      }
+      // 眉
+      const bt = e.browTilt*DEG*s, by = -eh-14 + e.browY;
+      ctx.beginPath();
+      ctx.moveTo(-ew*Math.cos(bt)-0, by+ew*Math.sin(bt)*-1);
+      ctx.quadraticCurveTo(0, by-6, ew*Math.cos(bt), by+ew*Math.sin(bt));
+      ctx.strokeStyle=PAL.line; ctx.lineWidth=3.5; ctx.stroke();
+      // 頬紅
+      if(e.blush>0){
+        ctx.beginPath(); ctx.ellipse(0, 22, 12*sq, 6, 0, 0, 7);
+        ctx.fillStyle=PAL.blush; ctx.globalAlpha=Math.min(1,f*3)*e.blush*.6; ctx.fill();
+      }
+      ctx.restore();
+    }
+    // 口
+    const {p:mp, f:mf} = faceCardPos(0,-18);
+    if(mf>0.02){
+      ctx.save(); ctx.translate(mp.x, mp.y); ctx.globalAlpha=Math.min(1,mf*3);
+      const sq = Math.max(.25, Math.min(1, mf*1.25));
+      const m = e.mouth;
+      if(m==="open"){
+        ctx.beginPath(); ctx.ellipse(0,2,10*sq,13,0,0,7);
+        fillStroke(PAL.mouthOpen, 3);
+      } else if(m==="smile"){
+        ctx.beginPath(); ctx.moveTo(-14*sq,-2); ctx.quadraticCurveTo(0,10,14*sq,-2);
+        ctx.strokeStyle=PAL.mouth; ctx.lineWidth=4; ctx.lineCap="round"; ctx.stroke();
+      } else if(m==="frown"){
+        ctx.beginPath(); ctx.moveTo(-10*sq,4); ctx.quadraticCurveTo(0,-4,10*sq,4);
+        ctx.strokeStyle=PAL.mouth; ctx.lineWidth=4; ctx.lineCap="round"; ctx.stroke();
+      } else {
+        ctx.beginPath(); ctx.moveTo(-8*sq,0); ctx.quadraticCurveTo(0,4,8*sq,0);
+        ctx.strokeStyle=PAL.mouth; ctx.lineWidth=3.5; ctx.lineCap="round"; ctx.stroke();
+      }
+      ctx.restore();
+    }
+    void blink;
+  });
+
+// ---- アホ毛(頭頂のリボン、常に最前面近く) ----
+addPart("ahoge",
+  () => view(onHead(0,90,1.1))[2]+6,
+  () => {
+    const b = onHead(0,86,1.0);
+    const sway = Math.sin(state.t*2.2)*6;
+    const spine = [b, [b[0]+6+sway*.4, b[1]+22, b[2]-2],
+                   [b[0]-8+sway, b[1]+40, b[2]-4]];
+    drawRibbon(spine, [5,4,1.5], PAL.hair, null);
+  });
+
+// ============================================================
+// メインループ
+// ============================================================
+function frame(dt){
+  state.t += dt;
+  if(state.spinning){
+    state.yaw += dt*60;
+    if(state.yaw>180) state.yaw-=360;
+    ui.yaw.value = Math.round(state.yaw);
+  }
+  // まばたき減衰
+  if(state.blink>0) state.blink = Math.max(0, state.blink - dt*6);
+  ui.yawv.textContent = Math.round(state.yaw)+"°";
+  ui.pitchv.textContent = Math.round(state.pitch)+"°";
+
+  ctx.clearRect(0,0,W,H);
+  // 足元の影
+  ctx.beginPath(); ctx.ellipse(CX, CY+150, 95, 16, 0, 0, 7);
+  ctx.fillStyle="rgba(0,0,0,.25)"; ctx.fill();
+
+  const order = parts.map(p=>({p, z:p.depthFn()}))
+                     .sort((a,b)=>a.z-b.z); // 奥(小さいz)から
+  for(const {p} of order) p.drawFn();
+}
+
+const ui = {
+  yaw: document.getElementById("yaw"),
+  pitch: document.getElementById("pitch"),
+  yawv: document.getElementById("yawv"),
+  pitchv: document.getElementById("pitchv"),
+};
+ui.yaw.addEventListener("input", e=>{ state.yaw=+e.target.value; state.spinning=false;
+  document.getElementById("spin").classList.remove("on"); });
+ui.pitch.addEventListener("input", e=>{ state.pitch=+e.target.value; });
+document.getElementById("expr").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b) return;
+  state.expr = b.dataset.e;
+  for(const x of e.currentTarget.querySelectorAll("button"))
+    x.classList.toggle("on", x===b);
+});
+document.getElementById("spin").addEventListener("click", e=>{
+  state.spinning=!state.spinning;
+  e.currentTarget.classList.toggle("on", state.spinning);
+});
+document.getElementById("blink").addEventListener("click", ()=>{ state.blink=1; });
+
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.05, (now-last)/1000); last = now;
+  frame(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---- スクリーンショット検証用フック(Playwrightから使用) ----
+window.__setPose = (yaw, pitch, expr, t)=>{
+  state.spinning=false;
+  state.yaw=yaw??0; state.pitch=pitch??0;
+  if(expr) state.expr=expr;
+  if(t!==undefined) state.t=t;
+  frame(0);
+};
+</script>
+</body>
+</html>

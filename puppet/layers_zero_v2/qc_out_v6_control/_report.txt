@@ -1,0 +1,9 @@
+angle=+15: ghost_px=0 gap_px=27 PASS
+angle=-15: ghost_px=0 gap_px=104 FAIL
+angle=+30: ghost_px=0 gap_px=175 FAIL
+angle=-30: ghost_px=0 gap_px=297 FAIL
+angle=+45: ghost_px=0 gap_px=243 FAIL
+angle=-45: ghost_px=0 gap_px=497 FAIL
+
+OVERALL: FAIL
+contact sheet: layers_zero_v2/qc_out_v6_control/_contact_sheet.png

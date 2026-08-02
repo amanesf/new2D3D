@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ピクセルパペット ビューア v3(メッシュワープ)</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #eef1f4;
+         display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  @media (prefers-color-scheme: dark) { body { background: #191b1e; color: #eee; } }
+  #stage { flex: 1 1 auto; min-height: 0; display: flex; justify-content: center;
+           align-items: center; padding: 6px; }
+  canvas { max-width: 100%; max-height: 100%; border-radius: 12px; background: #fbfbfb;
+           box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+  #ui { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px; justify-content: center;
+        padding: 8px; }
+  button { font-size: .85rem; padding: .45rem .8rem; border-radius: 999px;
+           border: 1px solid #ccc; background: #fff; cursor: pointer; color: #222; }
+  button:active { transform: scale(.96); }
+  button.on { background: #0ea5a3; color: #fff; border-color: #0ea5a3; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+<div id="ui">
+  <button data-act="greet">挨拶</button>
+  <button data-act="nod">頷き</button>
+  <button data-act="surprise">驚き</button>
+  <button data-act="joy">喜び</button>
+  <button id="t-talk">口パク</button>
+  <button id="t-gaze" class="on">視線</button>
+  <button id="t-blink" class="on">まばたき</button>
+  <button id="t-idle" class="on">待機</button>
+</div>
+<script src="manifest.js"></script>
+<script>
+"use strict";
+const M = window.MANIFEST;
+const [CW, CH] = M.size;
+const cv = document.getElementById("cv");
+cv.width = CW; cv.height = CH;
+const ctx = cv.getContext("2d");
+const off = document.createElement("canvas");
+off.width = CW; off.height = CH;
+const octx = off.getContext("2d");
+
+// ---- 画像ロード ----
+const imgs = {}, faceImgs = {};
+const bank = M.face_bank || {};
+let pending = M.draw_order.length + Object.keys(bank).length;
+const onload = () => { if (--pending === 0) requestAnimationFrame(tick); };
+for (const n of M.draw_order) {
+  const im = new Image();
+  im.src = "layers/" + n + ".png";
+  im.onload = onload;
+  imgs[n] = im;
+}
+for (const [k, path] of Object.entries(bank)) {
+  const im = new Image();
+  im.src = path;
+  im.onload = onload;
+  faceImgs[k] = im;
+}
+
+// ---- 2次ばね(柔らかい追従の核) ----
+function spring(freq, damp) {
+  return { x: 0, v: 0, t: 0, freq, damp,
+    step(dt) {
+      const w = this.freq * 6.2832;
+      this.v += (-w * w * (this.x - this.t) - 2 * this.damp * w * this.v) * dt;
+      this.x += this.v * dt;
+      return this.x;
+    } };
+}
+
+// ---- 状態・パラメータ ----
+const S = {
+  idle: true, gaze: true, autoBlink: true, talk: false,
+  nextBlink: performance.now() + 2200, blinkT: 0,
+  act: null, actT: 0,
+  gazeX: 0, gazeY: 0, gazeTX: 0, gazeTY: 0, pointerGaze: false,
+  w: { joy: 0, surprised: 0, mouth_aa: 0, blink: 0 },
+  wTarget: { joy: 0, surprised: 0 },
+};
+const P = {  // ワープパラメータ(すべてばね経由)
+  nodY: spring(1.1, 0.55),    // 頭の上下(px)
+  leanX: spring(0.9, 0.5),    // 頭の左右(px)
+  headR: spring(1.0, 0.5),    // 頭の回転(rad)
+  bodyY: spring(1.3, 0.6),    // 体の上下(px)
+  breath: spring(0.25, 1.0),  // 呼吸(px)
+  sway: spring(0.5, 0.35),    // 髪なびき振幅(px)
+};
+let swayPhase = 0;
+
+// ---- ワープ変形場 ----
+const sm01 = v => { v = Math.max(0, Math.min(1, v)); return v * v * (3 - 2 * v); };
+const PIVX = 420 - 120, PIVY = 262;  // 首元ピボット(クロップ座標)
+function disp(x, y) {
+  const wh = sm01((330 - y) / 150);          // 頭ウェイト: 首で滑らかに減衰
+  const wb = sm01((y - 140) / 360);          // 体ウェイト(下ほど大)
+  let dx = P.leanX.x * wh;
+  let dy = P.nodY.x * wh + P.bodyY.x + P.breath.x * wb;
+  const a = P.headR.x * wh;
+  if (a) {
+    const rx = x - PIVX, ry = y - PIVY, c = Math.cos(a), s = Math.sin(a);
+    dx += c * rx - s * ry - rx;
+    dy += s * rx + c * ry - ry;
+  }
+  // 髪のなびき: ポニーテール帯(左側)+毛先ほど振幅増の進行波
+  const wp = sm01((360 - x) / 240) * sm01((y - 60) / 320);
+  const ws = sm01((y - 210) / 130) * sm01((x - 180) / 120) * sm01((560 - x) / 160) * 0.35;
+  const hw = Math.max(wp, ws);
+  if (hw > 0.01) dx += (P.sway.x + 1.2) * Math.sin(swayPhase - y * 0.011) * hw;
+  return [dx, dy];
+}
+
+// ---- テクスチャ三角形描画によるグリッドワープ ----
+const GN = 16, GM = 18;
+const vx = new Float32Array((GN + 1) * (GM + 1)), vy = new Float32Array((GN + 1) * (GM + 1));
+function drawWarped(src) {
+  const xs = CW / GN, ys = CH / GM;
+  for (let j = 0; j <= GM; j++)
+    for (let i = 0; i <= GN; i++) {
+      const x = i * xs, y = j * ys, d = disp(x, y), n = j * (GN + 1) + i;
+      vx[n] = x + d[0]; vy[n] = y + d[1];
+    }
+  for (let j = 0; j < GM; j++)
+    for (let i = 0; i < GN; i++) {
+      const n = j * (GN + 1) + i, m = n + GN + 1;
+      const x0 = i * xs, y0 = j * ys, x1 = x0 + xs, y1 = y0 + ys;
+      tri(src, x0, y0, x1, y0, x0, y1, vx[n], vy[n], vx[n + 1], vy[n + 1], vx[m], vy[m]);
+      tri(src, x1, y0, x1, y1, x0, y1, vx[n + 1], vy[n + 1], vx[m + 1], vy[m + 1], vx[m], vy[m]);
+    }
+}
+function tri(img, sx0, sy0, sx1, sy1, sx2, sy2, dx0, dy0, dx1, dy1, dx2, dy2) {
+  // 三角形間のヘアラインクラック対策: 重心から僅かに膨張してクリップ
+  const gx = (dx0 + dx1 + dx2) / 3, gy = (dy0 + dy1 + dy2) / 3, e = 1.018;
+  const ex0 = gx + (dx0 - gx) * e, ey0 = gy + (dy0 - gy) * e;
+  const ex1 = gx + (dx1 - gx) * e, ey1 = gy + (dy1 - gy) * e;
+  const ex2 = gx + (dx2 - gx) * e, ey2 = gy + (dy2 - gy) * e;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(ex0, ey0); ctx.lineTo(ex1, ey1); ctx.lineTo(ex2, ey2);
+  ctx.closePath(); ctx.clip();
+  const den = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+  const a = (dx0 * (sy1 - sy2) + dx1 * (sy2 - sy0) + dx2 * (sy0 - sy1)) / den;
+  const b = (dy0 * (sy1 - sy2) + dy1 * (sy2 - sy0) + dy2 * (sy0 - sy1)) / den;
+  const c = (dx0 * (sx2 - sx1) + dx1 * (sx0 - sx2) + dx2 * (sx1 - sx0)) / den;
+  const d = (dy0 * (sx2 - sx1) + dy1 * (sx0 - sx2) + dy2 * (sx1 - sx0)) / den;
+  ctx.transform(a, b, c, d, dx0 - a * sx0 - c * sy0, dy0 - b * sx0 - d * sy0);
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+}
+
+// ---- アクション(ばねターゲットを時間関数で駆動) ----
+const ACTS = {
+  greet: { dur: 1500, fn(t) {
+    P.bodyY.t = -Math.abs(Math.sin(t * Math.PI * 3)) * 8;
+    P.headR.t += 0.06 * Math.sin(t * Math.PI);
+    S.wTarget.joy = t < 0.8 ? 1 : 0;
+  }},
+  nod: { dur: 1000, fn(t) {
+    P.nodY.t += Math.abs(Math.sin(t * Math.PI * 2)) * 11;
+    P.headR.t += Math.sin(t * Math.PI * 2) * 0.012;
+  }},
+  surprise: { dur: 1200, fn(t) {
+    const k = t < 0.15 ? t / 0.15 : (t > 0.75 ? (1 - t) / 0.25 : 1);
+    P.bodyY.t = -k * 10;
+    P.nodY.t -= k * 5;
+    S.wTarget.surprised = k;
+  }},
+  joy: { dur: 1600, fn(t) {
+    P.bodyY.t = -Math.abs(Math.sin(t * Math.PI * 4)) * 9;
+    S.wTarget.joy = t < 0.85 ? 1 : 0;
+  }},
+};
+
+// ---- UI ----
+document.querySelectorAll("[data-act]").forEach(b => {
+  b.onclick = () => { S.act = b.dataset.act; S.actT = performance.now(); };
+});
+const toggle = (id, key) => {
+  const b = document.getElementById(id);
+  b.onclick = () => { S[key] = !S[key]; b.classList.toggle("on", S[key]); };
+};
+toggle("t-talk", "talk");
+toggle("t-gaze", "gaze");
+toggle("t-blink", "autoBlink");
+toggle("t-idle", "idle");
+cv.addEventListener("pointermove", e => {
+  const r = cv.getBoundingClientRect();
+  S.pointerGaze = true;
+  S.gazeTX = ((e.clientX - r.left) / r.width - 0.5) * 6;
+  S.gazeTY = ((e.clientY - r.top) / r.height - 0.35) * 4;
+});
+cv.addEventListener("pointerleave", () => { S.pointerGaze = false; });
+
+// ---- オフスクリーン合成(無変形。動きは全てワープ側) ----
+function drawLayer(c, n, o) {
+  o = o || {};
+  const L = M.layers[n], A = M.anchors[n] || [L.x, L.y];
+  c.save();
+  c.translate(A[0] + (o.x || 0), A[1] + (o.y || 0));
+  if (o.r) c.rotate(o.r);
+  c.drawImage(imgs[n], L.x - A[0], L.y - A[1]);
+  c.restore();
+}
+function drawFace(c, key, alpha) {
+  const F = M.face;
+  if (!F || !faceImgs[key]) return;
+  c.save();
+  c.globalAlpha = alpha;
+  c.drawImage(faceImgs[key], F.x, F.y, F.w, F.h);
+  c.restore();
+}
+
+// ---- メインループ ----
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  const t = now / 1000;
+
+  // ターゲットのリセット→待機→アクションの順に積む
+  P.nodY.t = 0; P.leanX.t = 0; P.headR.t = 0; P.bodyY.t = 0; P.breath.t = 0;
+  S.wTarget.joy = 0; S.wTarget.surprised = 0;
+  let mouthOpen = false;
+
+  if (S.idle) {
+    P.breath.t = 2.6 * (0.5 + 0.5 * Math.sin(t * 1.35));
+    P.nodY.t += 1.6 * Math.sin(t * 1.35 + 0.7);
+    P.leanX.t += 2.2 * Math.sin(t * 0.53);
+    P.headR.t += 0.013 * Math.sin(t * 0.71) + 0.006 * Math.sin(t * 1.9);
+  }
+  if (S.act) {
+    const a = ACTS[S.act], p = (now - S.actT) / a.dur;
+    if (p >= 1) S.act = null; else a.fn(p);
+  }
+
+  // ばね更新+髪の位相(頭の速度でなびきが強まる)
+  for (const k in P) P[k].step(dt);
+  P.sway.t = Math.min(6, Math.abs(P.headR.v) * 60 + Math.abs(P.leanX.v) * 0.35);
+  swayPhase += dt * (2.1 + Math.abs(P.sway.x) * 0.35);
+
+  // まばたき
+  if (S.autoBlink && now > S.nextBlink && !S.wTarget.surprised) {
+    S.nextBlink = now + 2300 + Math.random() * 3200;
+    S.blinkT = now;
+  }
+  if (S.blinkT) {
+    const q = (now - S.blinkT) / 140;
+    S.w.blink = q < 1 ? sm01(q) : (q >= 1.9 ? 0 : sm01((1.9 - q) / 0.9));
+    if (q >= 1.9) { S.w.blink = 0; S.blinkT = 0; }
+  }
+
+  // 口パク(スナップ切替)
+  if (S.talk) {
+    const v = 0.55 + 0.45 * Math.sin(t * 10.5) + 0.2 * Math.sin(t * 23);
+    S.w.mouth_aa = v > 0.55 ? 1 : 0;
+    mouthOpen = S.w.mouth_aa > 0;
+  } else {
+    S.w.mouth_aa += (0 - S.w.mouth_aa) * Math.min(1, dt * 14);
+  }
+
+  // 表情フェード
+  for (const k of ["joy", "surprised"])
+    S.w[k] += (S.wTarget[k] - S.w[k]) * Math.min(1, dt * 12);
+
+  // 視線(積分しない。ポインタ非追従時はゆっくり周回)
+  if (!S.gaze) { S.gazeTX = 0; S.gazeTY = 0; }
+  else if (!S.pointerGaze) {
+    S.gazeTX = 2.2 * Math.sin(t * 0.23) + 0.8 * Math.sin(t * 0.61);
+    S.gazeTY = 1.2 * Math.sin(t * 0.17 + 1.3);
+  }
+  S.gazeX += (S.gazeTX - S.gazeX) * Math.min(1, dt * 6);
+  S.gazeY += (S.gazeTY - S.gazeY) * Math.min(1, dt * 6);
+
+  // ---- オフスクリーン合成(静止画) ----
+  octx.fillStyle = M.bg || "#fbfbfb";
+  octx.fillRect(0, 0, CW, CH);
+  octx.drawImage(imgs.base, 0, 0);
+  drawLayer(octx, "ponytail", {});
+  drawLayer(octx, "head", {});
+  drawLayer(octx, "eye_l", { x: S.gazeX * 0.55, y: S.gazeY * 0.55 });
+  drawLayer(octx, "eye_r", { x: S.gazeX * 0.55, y: S.gazeY * 0.55 });
+  drawLayer(octx, "mouth", {});
+  const expr = S.w.surprised > 0.02 ? ["surprised", S.w.surprised] :
+               S.w.joy > 0.02 ? ["joy", S.w.joy] : null;
+  if (expr) drawFace(octx, expr[0], expr[1]);
+  if (S.w.mouth_aa > 0.02 && !(expr && expr[0] === "surprised"))
+    drawFace(octx, "mouth_aa", S.w.mouth_aa);
+  if (S.w.blink > 0.02) drawFace(octx, "blink", S.w.blink);
+
+  // ---- ワープして本描画 ----
+  ctx.fillStyle = M.bg || "#fbfbfb";
+  ctx.fillRect(0, 0, CW, CH);
+  drawWarped(off);
+
+  requestAnimationFrame(tick);
+}
+</script>
+</body>
+</html>

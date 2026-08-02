@@ -1,0 +1,83 @@
+{
+  "character": "zero_v2",
+  "master": "characters/zero/master_v2_fullbody.png",
+  "canvas": {
+    "w": 512,
+    "h": 704
+  },
+  "layers": {
+    "base": {
+      "file": "base.png",
+      "kind": "static_full"
+    },
+    "ponytail": {
+      "file": "ponytail_v6.png",
+      "kind": "rotatable_cutout",
+      "place_xy": [
+        367,
+        154
+      ],
+      "pivot_global": [
+        376,
+        256
+      ],
+      "static_footprint_mask": "_ponytail_hole_mask_v6.png",
+      "mask_source": "color-threshold (x>=378 band) + connected-component hole fill",
+      "root_cover_patch": {
+        "file": "root_patch.png",
+        "place_xy": [
+          291,
+          171
+        ],
+        "purpose": "principle-1b: hides the rotation seam near the pivot under a static patch cut from the untouched master, regardless of rotation angle (radius 70px around pivot)",
+        "draw_order": "after ponytail (on top)"
+      },
+      "qc": {
+        "tool": "puppet/qc_gate.py",
+        "tested_angles_deg": [
+          15,
+          -15,
+          30,
+          -30,
+          45,
+          -45
+        ],
+        "result": "PASS (ghost_px=0, gap_px=0 all angles)",
+        "evidence": "puppet/layers_zero_v2/qc_out_v6_control/_patched_contact_sheet.png"
+      }
+    },
+    "head": {
+      "file": "head.png",
+      "kind": "feathered_cutout",
+      "crop": [
+        141,
+        83,
+        349,
+        271
+      ],
+      "rect_master_space": [
+        150,
+        92,
+        340,
+        262
+      ],
+      "feather_px": 9,
+      "face_feather_mask": "face_feather_mask.png",
+      "face_box_master_space": [
+        192,
+        138,
+        308,
+        232
+      ]
+    }
+  },
+  "notes": [
+    "旧master_bust.pngと異なり、ponytailは体・腕と非接触の構図(SUPER_LIVE2D_V3_PLAN.md Spike S1参照)。",
+    "expr_adopted/viseme_candidatesは旧マスターの顔スケールで生成されているため、face_box_master_spaceのサイズに合わせて要再生成(単純な貼り替えは不可)。"
+  ],
+  "base": {
+    "file": "base_holed_v6.png",
+    "kind": "static_full_holed",
+    "note": "ponytail region genuinely removed and filled (not base-intact)"
+  }
+}

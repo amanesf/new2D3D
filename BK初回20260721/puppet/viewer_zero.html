@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zeroキャラ ビューア(表情/viseme差し替え検証)</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html { height: 100%; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #eef1f4;
+         display: flex; flex-direction: column; min-height: 100vh; overflow-y: auto; }
+  @media (prefers-color-scheme: dark) { body { background: #191b1e; color: #eee; } }
+  #stage { flex: 1 1 auto; min-height: 0; display: flex; justify-content: center;
+           align-items: center; padding: 6px; }
+  canvas { max-width: 100%; max-height: 60vh; border-radius: 12px; background: #fbfbfb;
+           box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+  #ui { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px; justify-content: center;
+        padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px)); }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; width: 100%; }
+  button { font-size: .85rem; padding: .45rem .8rem; border-radius: 999px;
+           border: 1px solid #ccc; background: #fff; cursor: pointer; color: #222; }
+  button:active { transform: scale(.96); }
+  button.on { background: #0ea5a3; color: #fff; border-color: #0ea5a3; }
+  h2 { font-size: .7rem; margin: 4px 0 0; width: 100%; text-align: center; opacity: .6; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+<div id="ui">
+  <h2>表情</h2>
+  <div class="row" id="expr-row"></div>
+  <h2>viseme</h2>
+  <div class="row" id="viseme-row"></div>
+  <div class="row">
+    <button id="t-idle" class="on">待機ゆらぎ</button>
+    <button id="t-blink" class="on">自動まばたき</button>
+    <button id="t-talk">話す</button>
+    <button id="t-gaze" class="on">視線追従</button>
+  </div>
+  <h2>アクション</h2>
+  <div class="row">
+    <button data-act="greet">挨拶</button>
+    <button data-act="nod">頷き</button>
+    <button data-act="surprise">驚き</button>
+  </div>
+</div>
+<script>
+"use strict";
+const HEAD = { x: 46, y: 0, w: 423, h: 374 };
+const FACE_HOLE = { x: 34, y: 20, w: 352, h: 320 };
+const PONYTAIL = { x: 0, y: 33, w: 225, h: 567 };
+// ポニーテール多段振り子(VIEWER_QUALITY_PLAN.md §2-4)。build_hair_bands.pyで
+// 根元→毛先の4バンドに分割済み(puppet/layers_zero/ponytail_bands/manifest.json
+// と同じ値)。band0は頭に直結(継ぎ目防止のためheadと同一transformで描く)、
+// band1-3は前段からの相対回転を持つ振り子チェーン
+const PONYTAIL_BANDS = [
+  { file: "band0.png", crop_y0: 0 },
+  { file: "band1.png", crop_y0: 174, pivot: { x: 89.8, y: 36 } },
+  { file: "band2.png", crop_y0: 244, pivot: { x: 69.1, y: 36 } },
+  { file: "band3.png", crop_y0: 314, pivot: { x: 33.8, y: 36 } },
+  { file: "band4.png", crop_y0: 384, pivot: { x: 27.3, y: 36 } },
+  { file: "band5.png", crop_y0: 454, pivot: { x: 13.9, y: 36 } },
+];
+const SIZE = [512, 704];
+// まばたきは目のまわりだけに閉じる(head-layerローカル座標)。
+// 顔全域のface_feather_maskを使うと、closed/half候補画像が眉尻あたりまで
+// 差分を含む場合に髪・ヘッドセットの領域まで上書きしてしまうため、
+// 目だけを覆う小さいマスクに限定する。
+// 注意: まゆ毛は絶対に含めないこと。blink.pngはneutralの目だけを
+// inpaintしたもので、まゆ毛部分はneutralの絵のまま変化していないため、
+// ここにまゆ毛を含めるとjoy/angry/surprised等の表情中にまばたきすると
+// その表情のまゆ毛が一瞬neutralのまゆ毛に置き換わって見えてしまう
+// (表情が消えたように見える不具合の原因だった)
+const EYE_MASK_RECT = { x: 158, y: 155, w: 134, h: 70 };
+const EXPRESSIONS = ["neutral", "joy", "surprised", "sad", "angry", "relaxed"];
+const VISEMES = ["aa", "ih", "ou", "ee", "oh"];
+
+const cv = document.getElementById("cv");
+cv.width = SIZE[0]; cv.height = SIZE[1];
+const ctx = cv.getContext("2d");
+
+const off = document.createElement("canvas");
+off.width = HEAD.w; off.height = HEAD.h;
+const octx = off.getContext("2d");
+
+function load(src) {
+  return new Promise(res => { const im = new Image(); im.onload = () => res(im); im.src = src; });
+}
+
+let state = { expr: "neutral", viseme: null, idle: true, autoBlink: true, talk: false, gazeOn: true };
+let face = { cur: "expr:neutral", prev: null, fadeStart: 0, fadeDur: 260 };
+function setFace(key, dur) {
+  if (key === face.cur) return;
+  face.prev = face.cur;
+  face.cur = key;
+  face.fadeStart = performance.now();
+  face.fadeDur = dur || 260;
+}
+
+// ---- 2次ばね(パーツ別デフォーマの核。頭部の呼吸・傾き・頷きに使う) ----
+function spring(freq, damp) {
+  return { x: 0, v: 0, t: 0, freq, damp,
+    step(dt) {
+      const w = this.freq * 6.2832;
+      this.v += (-w * w * (this.x - this.t) - 2 * this.damp * w * this.v) * dt;
+      this.x += this.v * dt;
+      return this.x;
+    } };
+}
+const HEAD_PIVOT = { x: HEAD.x + FACE_HOLE.x + FACE_HOLE.w * 0.5, y: HEAD.y + HEAD.h - 15 };
+const P = {
+  nodY: spring(1.1, 0.55),   // 頭の上下(px)
+  leanX: spring(0.9, 0.5),   // 頭の左右(px)
+  headR: spring(1.0, 0.5),   // 頭の回転(rad)
+  bodyY: spring(1.3, 0.6),   // 体の上下(呼吸、px)
+};
+// ポニーテール振り子チェーン。band(i)の回転はband(i-1)の"現在の"角度を
+// 目標値として追いかける(周波数を段ごとに下げて根元→毛先に遅延を伝播させる、
+// 「しなり」の表現)。加えて根元(chain[0])は頭の動きと独立したゆるい
+// アイドル揺れも持つ
+// 6バンド(=関節5個)。4バンド版は1関節あたりの角度差が大きく、毛先の
+// スカスカな部分でキンク(継ぎ目)が視認されたため分割数を増やした
+// (2026-07-20)。周波数はなめらかに減衰させ、隣接段の差を小さく保つ
+const hairChain = [
+  spring(1.7, 0.34),
+  spring(1.35, 0.33),
+  spring(1.05, 0.32),
+  spring(0.8, 0.31),
+  spring(0.6, 0.30),
+];
+// 隣接バンドの継ぎ目はフェザーが「ほぼ同じ角度」前提で隠れる仕組み
+// (build_hair_bands.py参照)なので、角度そのものを増幅すると継ぎ目が
+// 露出する(2026-07-20に実際に発生・修正)。「しなり」は増幅ではなく
+// 段ごとの周波数・減衰差による位相遅れだけで表現する
+const HAIR_CHAIN_GAIN = 1.0;
+// 頬の後れ毛(side_hair_mask.pngで柔らかく抜いた部分)。輪郭を持たない
+// ソフトマスクなので、頭とわずかにずれても縁が視認されない
+// (VIEWER_QUALITY_PLAN.md §1 C 9の再挑戦、build_side_hair_mask.py参照)
+const sideHairX = spring(1.2, 0.30);
+const sideHairY = spring(0.9, 0.32);
+
+// ケープ裾先端の微スウェイ(VIEWER_QUALITY_PLAN.md §5-5)。後れ毛と同じ
+// ソフトマスク方式。対象は脚・ストラップにかからない裾の先端のみ
+// (build_cape_mask.py参照)
+const capeHemX = spring(0.55, 0.35), capeHemY = spring(0.45, 0.38);
+
+// 虹彩スライド(VIEWER_QUALITY_PLAN.md §5-1)。iris_mask_l/rの柔らかい
+// マスクで抜いた瞳パッチを、gaze.px/pyに応じて数pxだけずらす。
+// フェザー半径(9px)より小さい振幅に抑え、縁を絶対に見せない
+const irisLX = spring(3.0, 0.45), irisLY = spring(3.0, 0.45);
+const irisRX = spring(3.0, 0.45), irisRY = spring(3.0, 0.45);
+const IRIS_SLIDE_PX = 5.0;
+
+// ---- アクションプリセット(旧viewer.htmlのACTSを移植) ----
+const ACTS = {
+  greet: { dur: 1500, fn(t) {
+    P.bodyY.t += -Math.abs(Math.sin(t * Math.PI * 3)) * 8;
+    P.headR.t += 0.06 * Math.sin(t * Math.PI);
+    if (t < 0.8) setFace("expr:joy", 200);
+  } },
+  nod: { dur: 1000, fn(t) {
+    P.nodY.t += Math.abs(Math.sin(t * Math.PI * 2)) * 11;
+    P.headR.t += Math.sin(t * Math.PI * 2) * 0.012;
+  } },
+  surprise: { dur: 1200, fn(t) {
+    const k = t < 0.15 ? t / 0.15 : (t > 0.75 ? (1 - t) / 0.25 : 1);
+    P.bodyY.t += -k * 10;
+    P.nodY.t -= k * 5;
+    if (k > 0.5) setFace("expr:surprised", 120);
+  } },
+};
+let act = null, actStart = 0;
+
+// ---- アイドル表情演出(たまにjoy/relaxedになって戻る) ----
+// VIEWER_QUALITY_PLAN.md §1 C 8。表情ボタンでの手動選択(state.expr)を
+// 上書きしないよう、neutral選択中かつ話していない時だけ発動する
+let idlePerformAt = performance.now() + 4000 + Math.random() * 5000;
+let idlePerformUntil = 0;
+const IDLE_PERFORM_EXPRS = ["joy", "relaxed", "surprised"];
+function updateIdlePerform(now) {
+  if (!state.idle || state.talk || state.viseme || state.expr !== "neutral" || act) return;
+  if (idlePerformUntil && now < idlePerformUntil) return;
+  if (idlePerformUntil && now >= idlePerformUntil) {
+    idlePerformUntil = 0;
+    setFace("expr:neutral", 400);
+    idlePerformAt = now + 5000 + Math.random() * 7000;
+    return;
+  }
+  if (now >= idlePerformAt) {
+    const pick = IDLE_PERFORM_EXPRS[Math.floor(Math.random() * IDLE_PERFORM_EXPRS.length)];
+    setFace("expr:" + pick, 300);
+    idlePerformUntil = now + 900 + Math.random() * 900;
+  }
+}
+
+// ---- 視線(ポインタ追従+アイドル時のゆっくりした徘徊) ----
+// VIEWER_QUALITY_PLAN.md §1 C 3。虹彩の局所ワープはレイヤー未分離のため
+// 見送り、首の追従(headR/leanXへの微小な寄与)で視線が合う感を出す。
+const gaze = { px: 0, py: 0, active: false };
+
+async function main() {
+  const [base, head, mask, blinkImg, sideHairMaskImg, irisMaskL, irisMaskR, capeHemMaskImg, chestMaskImg, ...ponytailBandImgs] = await Promise.all([
+    load("layers_zero/base.png"),
+    load("layers_zero/head.png"),
+    load("layers_zero/face_feather_mask_rgba.png"),
+    load("../characters/zero/expr_adopted/blink.png"),
+    load("layers_zero/side_hair_mask.png"),
+    load("layers_zero/iris_mask_l.png"),
+    load("layers_zero/iris_mask_r.png"),
+    load("layers_zero/cape_hem_mask.png"),
+    load("layers_zero/chest_mask.png"),
+    ...PONYTAIL_BANDS.map(b => load("layers_zero/ponytail_bands/" + b.file)),
+  ]);
+  // ケープ裾先端パッチ。baseは無傷の単一絵で毎フレーム丸ごと描き直される
+  // ため(ゴーストの心配が無い)、後れ毛より単純に静的なマスクで抜いておける
+  const capeHemOff = document.createElement("canvas");
+  capeHemOff.width = SIZE[0]; capeHemOff.height = SIZE[1];
+  const chctx = capeHemOff.getContext("2d");
+  chctx.drawImage(base, 0, 0);
+  chctx.globalCompositeOperation = "destination-in";
+  chctx.drawImage(capeHemMaskImg, 0, 0, SIZE[0], SIZE[1]);
+  chctx.globalCompositeOperation = "source-over";
+  // 胸・肋骨パッチ(呼吸で膨らむ表現用)。同じくbaseから静的に一度だけ抜く
+  const chestOff = document.createElement("canvas");
+  chestOff.width = SIZE[0]; chestOff.height = SIZE[1];
+  const cxctx = chestOff.getContext("2d");
+  cxctx.drawImage(base, 0, 0);
+  cxctx.globalCompositeOperation = "destination-in";
+  cxctx.drawImage(chestMaskImg, 0, 0, SIZE[0], SIZE[1]);
+  cxctx.globalCompositeOperation = "source-over";
+  const CHEST_PIVOT = { x: 250, y: 405 };
+  // 虹彩スライド用パッチ(後れ毛と同じソフトマスク方式。毎フレーム
+  // head+現在の表情合成後のoffから抜き直す。理由はsideHairOffと同じ)
+  const irisOffL = document.createElement("canvas");
+  irisOffL.width = HEAD.w; irisOffL.height = HEAD.h;
+  const ilctx = irisOffL.getContext("2d");
+  const irisOffR = document.createElement("canvas");
+  irisOffR.width = HEAD.w; irisOffR.height = HEAD.h;
+  const irctx = irisOffR.getContext("2d");
+  // 頬の後れ毛パッチ。マスク領域がFACE_HOLE(表情差し替え域)と重なるため、
+  // head.png(neutral固定)からではなく、毎フレーム表情合成後のoff canvasから
+  // 抜く(そうしないと選択中の表情の上に古いneutralの頬・目元が乗ってしまい、
+  // 表情切り替えが見えなくなる)
+  const sideHairOff = document.createElement("canvas");
+  sideHairOff.width = HEAD.w; sideHairOff.height = HEAD.h;
+  const shctx = sideHairOff.getContext("2d");
+  const blinkOff = document.createElement("canvas");
+  blinkOff.width = HEAD.w; blinkOff.height = HEAD.h;
+  const boctx = blinkOff.getContext("2d");
+  // まばたき専用の目だけマスク(顔全体マスクの代わりに使う。destination-inで
+  // 使うのでアルファだけ意味を持つ。fillRect+filter:blurで縁を自然にフェザー)
+  const eyeMaskOff = document.createElement("canvas");
+  eyeMaskOff.width = HEAD.w; eyeMaskOff.height = HEAD.h;
+  const emctx = eyeMaskOff.getContext("2d");
+  emctx.filter = "blur(8px)";
+  emctx.fillStyle = "#fff";
+  emctx.fillRect(EYE_MASK_RECT.x, EYE_MASK_RECT.y, EYE_MASK_RECT.w, EYE_MASK_RECT.h);
+  emctx.filter = "none";
+  const exprImgs = {}, visemeImgs = {};
+  await Promise.all(EXPRESSIONS.map(async n => {
+    exprImgs[n] = await load("../characters/zero/expr_adopted/" + n + ".png");
+  }));
+  await Promise.all(VISEMES.map(async n => {
+    visemeImgs[n] = await load("../characters/zero/expr_adopted/viseme/" + n + ".png");
+  }));
+
+  function buildRow(id, names, imgs, key) {
+    const row = document.getElementById(id);
+    names.forEach(n => {
+      const b = document.createElement("button");
+      b.textContent = n;
+      if (key === "expr" && n === "neutral") b.classList.add("on");
+      b.onclick = () => {
+        row.querySelectorAll("button").forEach(x => x.classList.remove("on"));
+        if (key === "viseme" && state.viseme === n) {
+          state.viseme = null; // トグルで解除
+        } else {
+          b.classList.add("on");
+          state[key] = n;
+        }
+        setFace(state.viseme ? "viseme:" + state.viseme : "expr:" + state.expr);
+      };
+      row.appendChild(b);
+    });
+  }
+  buildRow("expr-row", EXPRESSIONS, exprImgs, "expr");
+  buildRow("viseme-row", VISEMES, visemeImgs, "viseme");
+
+  function imgForKey(key) {
+    if (!key) return exprImgs.neutral;
+    const [kind, name] = key.split(":");
+    return kind === "viseme" ? visemeImgs[name] : (exprImgs[name] || exprImgs.neutral);
+  }
+  // 顔レイヤーのパララックス(VIEWER_QUALITY_PLAN.md §5-2)。頭の傾き/回転と
+  // 逆方向に顔テクスチャを数pxずらすことで、頭部が疑似的に奥行きを持って
+  // 向きを変えているように見せる。face_feather_maskの縁フェザーが吸収
+  // できる範囲(数px)に振幅を抑える
+  let faceParallaxX = 0, faceParallaxY = 0;
+  function compositeFace(img, alpha) {
+    octx.globalAlpha = alpha;
+    octx.drawImage(img, FACE_HOLE.x + faceParallaxX, FACE_HOLE.y + faceParallaxY, FACE_HOLE.w, FACE_HOLE.h);
+    octx.globalAlpha = 1;
+  }
+
+  // ---- 自動まばたき ----
+  const BLINK_MS = 140; // 閉じて開くまでの合計時間
+  const sm01 = v => { v = Math.max(0, Math.min(1, v)); return v * v * (3 - 2 * v); };
+  let nextBlinkAt = performance.now() + 1200 + Math.random() * 2500;
+  let blinkStart = null;
+  function blinkAlphaAt(now) {
+    if (!state.autoBlink) return 0;
+    if (blinkStart === null && now >= nextBlinkAt) blinkStart = now;
+    if (blinkStart === null) return 0;
+    const p = (now - blinkStart) / BLINK_MS;
+    if (p >= 1) {
+      blinkStart = null;
+      nextBlinkAt = now + 2200 + Math.random() * 3200;
+      return 0;
+    }
+    // 三角波: 前半で閉じる、後半で開く
+    return p < 0.5 ? sm01(p / 0.5) : sm01((1 - p) / 0.5);
+  }
+
+  // ---- 口パク自動ループ(「話す」トグル) ----
+  // VIEWER_QUALITY_PLAN.md §1 C 2: viseme列をリズム遷移。
+  // 「ちかちか」対策: (1) ポーズ時に選択中の表情(joy等)へ戻すと目のスタイルが
+  // visemeのneutral由来の目と入れ替わって点滅して見えるため、ポーズは常に
+  // expr:neutralに統一する。(2) 切り替え間隔をフェード時間より必ず長くして
+  // 前のフェードが終わる前に次の切り替えが来る「ポップ」を防ぐ。
+  const TALK_FADE_MS = 70;
+  let talkNextAt = 0;
+  function updateTalk(now) {
+    if (!state.talk || now < talkNextAt) return;
+    const choices = VISEMES.concat([null, null]); // null=口を閉じる間(ポーズ)を混ぜる
+    const pick = choices[Math.floor(Math.random() * choices.length)];
+    const key = pick ? "viseme:" + pick : "expr:neutral";
+    setFace(key, TALK_FADE_MS);
+    talkNextAt = now + TALK_FADE_MS + 60 + Math.random() * 90; // 常にTALK_FADE_MSより長い間隔
+  }
+
+  let t0 = performance.now(), lastT = t0;
+  function draw(now) {
+    now = now || performance.now();
+    const dt = Math.min(0.05, (now - lastT) / 1000);
+    lastT = now;
+    const t = (now - t0) / 1000;
+
+    // アイドル時はゆっくり視線が徘徊、ポインタが乗ったら追従に切り替え
+    if (state.gazeOn && !gaze.active) {
+      gaze.px = 0.5 * Math.sin(t * 0.23) + 0.3 * Math.sin(t * 0.61);
+      gaze.py = 0.4 * Math.sin(t * 0.17 + 1.3);
+    }
+    P.nodY.t = 0; P.leanX.t = 0; P.headR.t = 0; P.bodyY.t = 0;
+    if (state.idle) {
+      P.bodyY.t = 1.8 * (0.5 + 0.5 * Math.sin(t * 1.35));   // 呼吸
+      P.nodY.t += 1.4 * Math.sin(t * 1.35 + 0.7);           // 頭の上下(呼吸に連動)
+      P.leanX.t += 1.8 * Math.sin(t * 0.53);                // ゆっくり首を傾ける
+      P.headR.t += 0.02 * Math.sin(t * 0.71) + 0.008 * Math.sin(t * 1.9);
+    }
+    if (state.gazeOn) {
+      P.leanX.t += gaze.px * 5;
+      P.headR.t += gaze.px * 0.03;
+      P.nodY.t += gaze.py * 3.2;
+    }
+    if (act) {
+      const a = ACTS[act], p = (now - actStart) / a.dur;
+      if (p >= 1) { act = null; setFace("expr:" + state.expr, 250); }
+      else a.fn(p);
+    }
+    for (const k in P) P[k].step(dt);
+    // ポニーテール振り子: 根元(chain[0])は頭の回転+ゆるいアイドル揺れを
+    // 追いかけ、以降のバンドは前段の"現在の"角度を追いかける(段ごとに
+    // 周波数を下げてあるので、根元→毛先へ遅延が伝播して「しなり」が出る)
+    const hairIdleSway = state.idle ? 0.11 * Math.sin(t * 0.4) + 0.045 * Math.sin(t * 0.9 + 1) : 0;
+    hairChain[0].t = P.headR.x * 4 + P.leanX.x * 0.03 + hairIdleSway;
+    for (let i = 1; i < hairChain.length; i++) hairChain[i].t = hairChain[i - 1].x * HAIR_CHAIN_GAIN;
+    for (const s of hairChain) s.step(dt);
+    // 後れ毛のソフトスウェイ。振幅はマスクのフェザー幅(20px)よりずっと
+    // 小さく抑え、頭とのズレが常に馴染むようにする
+    const sideIdleSway = state.idle ? 0.6 * Math.sin(t * 0.9 + 0.4) : 0;
+    sideHairX.t = P.headR.x * 30 + sideIdleSway;
+    sideHairY.t = P.nodY.x * 0.15 + (state.idle ? 0.3 * Math.sin(t * 0.7) : 0);
+    sideHairX.step(dt); sideHairY.step(dt);
+    // 虹彩スライド。gazeはポインタ追従/アイドル徘徊で-1..1のレンジなので
+    // そのままIRIS_SLIDE_PXを掛ける。首の追従(headR/leanX)と同時に動くので
+    // 「目が合う」感が強まる
+    irisLX.t = gaze.px * IRIS_SLIDE_PX; irisLY.t = gaze.py * IRIS_SLIDE_PX;
+    irisRX.t = gaze.px * IRIS_SLIDE_PX; irisRY.t = gaze.py * IRIS_SLIDE_PX;
+    irisLX.step(dt); irisLY.step(dt); irisRX.step(dt); irisRY.step(dt);
+    // ケープ裾のゆっくりした独立スウェイ(体・脚とは別位相)
+    const capeIdleSway = state.idle ? 1.4 * Math.sin(t * 0.5) + 0.6 * Math.sin(t * 1.1 + 0.6) : 0;
+    capeHemX.t = capeIdleSway + P.leanX.x * 0.2;
+    capeHemY.t = state.idle ? 0.8 * Math.sin(t * 0.6 + 1) : 0;
+    capeHemX.step(dt); capeHemY.step(dt);
+    // 呼吸で胸・肋骨まわりだけがわずかに膨らむ(下端ピボット基準のスケール)。
+    // P.bodyY(呼吸の上下動)と同位相にして一体感を出す
+    const chestScale = 1 + P.bodyY.x * 0.006;
+    updateTalk(now);
+    updateIdlePerform(now);
+
+    ctx.fillStyle = "#fefeff";
+    ctx.fillRect(0, 0, SIZE[0], SIZE[1]);
+    ctx.save();
+    ctx.translate(0, P.bodyY.x);
+    ctx.drawImage(base, 0, 0);
+    ctx.drawImage(capeHemOff, capeHemX.x, capeHemY.x);
+    ctx.save();
+    ctx.translate(CHEST_PIVOT.x, CHEST_PIVOT.y);
+    ctx.scale(chestScale, chestScale);
+    ctx.translate(-CHEST_PIVOT.x, -CHEST_PIVOT.y);
+    ctx.drawImage(chestOff, 0, 0);
+    ctx.restore();
+    ctx.translate(P.leanX.x, P.nodY.x);
+    ctx.translate(HEAD_PIVOT.x, HEAD_PIVOT.y);
+    ctx.rotate(P.headR.x);
+    ctx.translate(-HEAD_PIVOT.x, -HEAD_PIVOT.y);
+    // ポニーテール多段振り子。band0は頭と完全に同じtransformで描く
+    // (継ぎ目防止。切り出し境界がぴったり噛み合っているので、相対的に
+    // ずらすと隙間が出る)。band1以降は前段の接続点(pivot)を中心に
+    // hairChainの角度だけ追加回転して描く(ctx.rotateは現在の変形の上に
+    // 重なるので、自然に根元からの連鎖になる)
+    ctx.save();
+    ctx.drawImage(ponytailBandImgs[0], PONYTAIL.x, PONYTAIL.y + PONYTAIL_BANDS[0].crop_y0);
+    for (let i = 1; i < PONYTAIL_BANDS.length; i++) {
+      const b = PONYTAIL_BANDS[i];
+      const px = PONYTAIL.x + b.pivot.x, py = PONYTAIL.y + b.crop_y0 + b.pivot.y;
+      ctx.translate(px, py);
+      ctx.rotate(hairChain[i - 1].x);
+      ctx.translate(-px, -py);
+      ctx.drawImage(ponytailBandImgs[i], PONYTAIL.x, PONYTAIL.y + b.crop_y0);
+    }
+    ctx.restore();
+    ctx.drawImage(head, HEAD.x, HEAD.y);
+    // 顔パララックス: 頭の回転・左右傾きと逆方向に数pxずらす
+    faceParallaxX = -P.leanX.x * 0.5 - P.headR.x * 70;
+    faceParallaxY = -P.nodY.x * 0.20;
+    // 表情/visemeのクロスフェード(数百msでパッと切り替わらないようにする)
+    octx.clearRect(0, 0, HEAD.w, HEAD.h);
+    const fadeP = Math.min(1, (now - face.fadeStart) / face.fadeDur);
+    if (face.prev && fadeP < 1) compositeFace(imgForKey(face.prev), 1 - fadeP);
+    compositeFace(imgForKey(face.cur), face.prev && fadeP < 1 ? fadeP : 1);
+    octx.globalCompositeOperation = "destination-in";
+    octx.drawImage(mask, 0, 0, HEAD.w, HEAD.h);
+    octx.globalCompositeOperation = "source-over";
+    ctx.drawImage(off, HEAD.x, HEAD.y);
+    // 頬の後れ毛。head+現在の表情合成後のoffから毎フレーム抜き直す
+    // (静的なhead.pngから抜くと選択中の表情の上に古いneutralが乗ってしまう)。
+    // ソフトマスクなので頭からわずかにずれても縁が見えない
+    shctx.clearRect(0, 0, HEAD.w, HEAD.h);
+    shctx.drawImage(head, 0, 0);
+    shctx.drawImage(off, 0, 0);
+    shctx.globalCompositeOperation = "destination-in";
+    shctx.drawImage(sideHairMaskImg, 0, 0, HEAD.w, HEAD.h);
+    shctx.globalCompositeOperation = "source-over";
+    ctx.drawImage(sideHairOff, HEAD.x + sideHairX.x, HEAD.y + sideHairY.x);
+    // 虹彩スライド。同じ理由でhead+現在の表情合成後のoffから毎フレーム
+    // 抜き直す(まぶた形状は表情ごとに変わるため)
+    ilctx.clearRect(0, 0, HEAD.w, HEAD.h);
+    ilctx.drawImage(head, 0, 0);
+    ilctx.drawImage(off, 0, 0);
+    ilctx.globalCompositeOperation = "destination-in";
+    ilctx.drawImage(irisMaskL, 0, 0, HEAD.w, HEAD.h);
+    ilctx.globalCompositeOperation = "source-over";
+    ctx.drawImage(irisOffL, HEAD.x + irisLX.x, HEAD.y + irisLY.x);
+    irctx.clearRect(0, 0, HEAD.w, HEAD.h);
+    irctx.drawImage(head, 0, 0);
+    irctx.drawImage(off, 0, 0);
+    irctx.globalCompositeOperation = "destination-in";
+    irctx.drawImage(irisMaskR, 0, 0, HEAD.w, HEAD.h);
+    irctx.globalCompositeOperation = "source-over";
+    ctx.drawImage(irisOffR, HEAD.x + irisRX.x, HEAD.y + irisRY.x);
+
+    // まばたき(neutral由来の閉眼フレームを短時間だけ上に重ねる)。
+    // マスクは顔全体ではなく目だけの小さいeyeMaskOffを使い、髪・ヘッドセットの
+    // 領域には絶対にかからないようにする
+    const bAlpha = blinkAlphaAt(now);
+    if (bAlpha > 0.02) {
+      boctx.clearRect(0, 0, HEAD.w, HEAD.h);
+      boctx.globalAlpha = bAlpha;
+      boctx.drawImage(blinkImg, FACE_HOLE.x, FACE_HOLE.y, FACE_HOLE.w, FACE_HOLE.h);
+      boctx.globalAlpha = 1;
+      boctx.globalCompositeOperation = "destination-in";
+      boctx.drawImage(eyeMaskOff, 0, 0);
+      boctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(blinkOff, HEAD.x, HEAD.y);
+    }
+    ctx.restore();
+    requestAnimationFrame(draw);
+  }
+  document.querySelectorAll("[data-act]").forEach((b) => {
+    b.onclick = () => { act = b.dataset.act; actStart = performance.now(); };
+  });
+  document.getElementById("t-idle").onclick = (e) => {
+    state.idle = !state.idle;
+    e.target.classList.toggle("on", state.idle);
+  };
+  document.getElementById("t-blink").onclick = (e) => {
+    state.autoBlink = !state.autoBlink;
+    e.target.classList.toggle("on", state.autoBlink);
+  };
+  document.getElementById("t-gaze").onclick = (e) => {
+    state.gazeOn = !state.gazeOn;
+    e.target.classList.toggle("on", state.gazeOn);
+    if (!state.gazeOn) { gaze.px = 0; gaze.py = 0; gaze.active = false; }
+  };
+  cv.addEventListener("pointermove", (e) => {
+    if (!state.gazeOn) return;
+    const r = cv.getBoundingClientRect();
+    gaze.active = true;
+    gaze.px = ((e.clientX - r.left) / r.width - 0.5) * 2;   // -1..1
+    gaze.py = ((e.clientY - r.top) / r.height - 0.35) * 2;
+  });
+  cv.addEventListener("pointerleave", () => { gaze.active = false; });
+  document.getElementById("t-talk").onclick = (e) => {
+    state.talk = !state.talk;
+    e.target.classList.toggle("on", state.talk);
+    if (!state.talk) {
+      talkNextAt = 0;
+      setFace(state.viseme ? "viseme:" + state.viseme : "expr:" + state.expr, 150);
+    }
+  };
+  requestAnimationFrame(draw);
+}
+main();
+</script>
+</body>
+</html>

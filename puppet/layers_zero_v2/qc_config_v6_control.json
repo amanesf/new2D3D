@@ -1,0 +1,40 @@
+{
+  "base_holed": "base_holed_v6.png",
+  "sprite": "ponytail_v6.png",
+  "sprite_place_xy": [
+    367,
+    154
+  ],
+  "pivot_local": [
+    9,
+    102
+  ],
+  "static_footprint_mask": "_ponytail_hole_mask_v6.png",
+  "connection_zone_mask": "_connection_zone_test.png",
+  "original_master": "../../characters/zero/master_v2_fullbody.png",
+  "test_angles": [
+    15,
+    -15,
+    30,
+    -30,
+    45,
+    -45
+  ],
+  "boundary_crop_boxes": [
+    [
+      330,
+      100,
+      470,
+      260
+    ],
+    [
+      330,
+      220,
+      470,
+      340
+    ]
+  ],
+  "zoom_scale": 3,
+  "ghost_tolerance_px": 50,
+  "gap_tolerance_px": 50
+}

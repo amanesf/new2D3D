@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Vector Puppet — 金髪ツインテール(正面立ち絵1枚から作成)</title>
+<style>
+  html,body{margin:0;padding:0;background:#f2f0ea;color:#333;
+    font-family:system-ui,sans-serif;touch-action:manipulation;}
+  #wrap{max-width:480px;margin:0 auto;padding:8px;}
+  canvas{width:100%;height:auto;display:block;background:#ffffff;border-radius:12px;
+    box-shadow:0 1px 6px rgba(0,0,0,.12);}
+  .row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;}
+  .row label{font-size:12px;min-width:44px;}
+  input[type=range]{flex:1;}
+  button{background:#e3e0d6;color:#333;border:0;border-radius:8px;
+    padding:8px 12px;font-size:13px;}
+  button.on{background:#a8cf5e;}
+  #note{font-size:11px;opacity:.6;margin-top:8px;line-height:1.5;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="480" height="640"></canvas>
+  <div class="row"><label>yaw</label>
+    <input type="range" id="yaw" min="-180" max="180" value="0" step="1">
+    <span id="yawv" style="font-size:12px;width:40px;text-align:right">0°</span></div>
+  <div class="row" id="expr">
+    <button data-e="neutral" class="on">neutral</button>
+    <button data-e="happy">happy</button>
+    <button data-e="angry">angry</button>
+    <button data-e="sad">sad</button>
+    <button data-e="surprised">surprised</button>
+  </div>
+  <div class="row">
+    <button id="spin">自動回転</button>
+    <button id="blink">まばたき</button>
+  </div>
+  <div id="note">
+    正面立ち絵1枚から採寸・配色したベクターパペット。画像素材ゼロ。
+    奥行きはプリミティブ(球面カード/リボン/ボリューム)の構造から補完。
+  </div>
+</div>
+<script>
+"use strict";
+// ============================================================
+// 正面立ち絵1枚からのベクターパペット化(ILLUST_TO_PUPPET_WORKFLOW.md参照)
+// 採寸単位: 頭部半径r=40px相当。約6頭身。
+// ============================================================
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+// ---- パレット(原画から目視サンプリング) ----
+const PAL = {
+  skin:"#ffe9dc", skinShade:"#f3cdbb",
+  hair:"#f2cc68", hairShade:"#d8a844", hairHi:"#fce9ad",
+  eyeIris:"#6674c4", eyeIrisD:"#3d478f", eyeDark:"#2a2d43",
+  brow:"#c9a04e",
+  sweater:"#3c3f3c", sweaterLine:"rgba(220,222,214,.55)",
+  sweaterLine2:"rgba(160,140,100,.35)",
+  scarf:"#c53b4b", scarfShade:"#9e2c3c",
+  skirt:"#a8cf5e", skirtShade:"#84ab3f",
+  stocking:"#3a3a40", stockingHi:"#55555e",
+  boot:"#474a47", bootSole:"#a8cf5e", lace:"#7fae4a",
+  acc:"#7fb84f", accShade:"#5e9436",
+  line:"#4a3a30", mouth:"#c46a6a",
+};
+
+// ---- 状態 ----
+const state = { yaw:0, pitch:0, t:0, expr:"neutral", blink:0, spinning:false };
+
+// ---- 3Dミニ数学(直交投影、キャラ空間: 原点=首の付け根、+y上、+zカメラ) ----
+const DEG = Math.PI/180;
+function rotY(p, a){ const c=Math.cos(a), s=Math.sin(a);
+  return [p[0]*c + p[2]*s, p[1], -p[0]*s + p[2]*c]; }
+function view(p){ return rotY(p, state.yaw*DEG); }
+const CX = W/2, CY = 152;
+function proj(p){ const v = view(p); return {x:CX+v[0], y:CY-v[1], z:v[2]}; }
+
+// 体・脚は首より遅れて追従する(ラグ方式)。
+// 体yaw = yaw − lag·sin(yaw): 小角度では視差として遅れ、180°では完全に追いつく
+function bodyYawRad(lagDeg){
+  const y = state.yaw*DEG;
+  return y - lagDeg*DEG*Math.sin(y);
+}
+function bodyView(p, lagDeg){ return rotY(p, bodyYawRad(lagDeg)); }
+function bodyProj(p, lagDeg){
+  const v = bodyView(p, lagDeg); return {x:CX+v[0], y:CY-v[1], z:v[2]};
+}
+const LAG_BODY = 38, LAG_LEGS = 55;
+
+// ---- 描画ヘルパ ----
+function path(pts, close){
+  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+  for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+  if(close!==false) ctx.closePath();
+}
+function smoothPath(pts, close){
+  ctx.beginPath();
+  const n = pts.length;
+  ctx.moveTo(pts[0].x, pts[0].y);
+  const wrap = close!==false;
+  const last = wrap? n : n-1;
+  for(let i=0;i<last;i++){
+    const p0 = pts[(i-1+n)%n], p1 = pts[i], p2 = pts[(i+1)%n], p3 = pts[(i+2)%n];
+    const c1 = {x:p1.x+(p2.x-p0.x)/6, y:p1.y+(p2.y-p0.y)/6};
+    const c2 = {x:p2.x-(p3.x-p1.x)/6, y:p2.y-(p3.y-p1.y)/6};
+    ctx.bezierCurveTo(c1.x,c1.y,c2.x,c2.y,p2.x,p2.y);
+  }
+  if(wrap) ctx.closePath();
+}
+function fillStroke(fill, lw){
+  ctx.fillStyle = fill; ctx.fill();
+  if(lw){ ctx.strokeStyle = PAL.line; ctx.lineWidth = lw;
+    ctx.lineJoin="round"; ctx.lineCap="round"; ctx.stroke(); }
+}
+
+// ---- リボン(チューブ): 3Dスパイン→投影→画面空間で幅オフセット ----
+function ribbonOutline(spine3d, widths, projFn){
+  const pts = spine3d.map(projFn || proj);
+  const L=[], R=[];
+  for(let i=0;i<pts.length;i++){
+    const a = pts[Math.max(0,i-1)], b = pts[Math.min(pts.length-1,i+1)];
+    let dx=b.x-a.x, dy=b.y-a.y; const len=Math.hypot(dx,dy)||1;
+    dx/=len; dy/=len;
+    const w = widths[i];
+    L.push({x:pts[i].x-dy*w, y:pts[i].y+dx*w});
+    R.push({x:pts[i].x+dy*w, y:pts[i].y-dx*w});
+  }
+  return {outline:L.concat(R.reverse()), pts};
+}
+function drawRibbon(spine3d, widths, fill, shade, projFn){
+  const {outline} = ribbonOutline(spine3d, widths, projFn);
+  smoothPath(outline);
+  fillStroke(fill, 2.5);
+  if(shade){
+    ctx.save(); smoothPath(outline); ctx.clip();
+    ctx.translate(5,4); smoothPath(outline);
+    ctx.fillStyle=shade; ctx.globalAlpha=.45; ctx.fill();
+    ctx.restore(); ctx.globalAlpha=1;
+  }
+}
+
+// ---- 頭部球(採寸: r=40、中心は首上+52) ----
+const HEAD = { c:[0,52,0], r:40 };
+function onHead(azimuthDeg, elevDeg, out=1){
+  const a=azimuthDeg*DEG, e=elevDeg*DEG, r=HEAD.r*out;
+  return [ r*Math.cos(e)*Math.sin(a),
+           HEAD.c[1] + r*Math.sin(e),
+           r*Math.cos(e)*Math.cos(a) ];
+}
+function facing(azimuthDeg, elevDeg){
+  const v = view(onHead(azimuthDeg, elevDeg));
+  return v[2] / HEAD.r;
+}
+
+// ---- 表情(VRMプリセット互換) ----
+const EXPR = {
+  neutral:  {eyeOpen:1, eyeCurve:0,  browY:0,  browTilt:0,  mouth:"smile", blush:.25},
+  happy:    {eyeOpen:.15,eyeCurve:1, browY:-2, browTilt:-6, mouth:"smileBig", blush:.8},
+  angry:    {eyeOpen:.8, eyeCurve:0, browY:4,  browTilt:12, mouth:"frown", blush:0},
+  sad:      {eyeOpen:.55,eyeCurve:0, browY:2,  browTilt:-10,mouth:"frown", blush:.3},
+  surprised:{eyeOpen:1.2,eyeCurve:0, browY:-6, browTilt:0,  mouth:"open",  blush:.2},
+};
+
+const parts = [];
+function addPart(name, depthFn, drawFn){ parts.push({name, depthFn, drawFn}); }
+
+// ============================================================
+// 後ろ髪(頭全周を覆う土台+背面に落ちる毛束)
+// ============================================================
+addPart("backHair",
+  () => view(onHead(180,0))[2] - 6,
+  () => {
+    const c = proj(HEAD.c);
+    const behind = Math.cos(state.yaw*DEG) > 0;
+    const pts=[];
+    for(let i=0;i<=12;i++){
+      const a = -106 + i*17.7;
+      const rad = HEAD.r*1.12 + 4*Math.sin(i*2.1+1);
+      pts.push({x:c.x + rad*Math.sin(a*DEG), y:c.y - rad*Math.cos(a*DEG)});
+    }
+    // 襟足(短め: ボリュームはツインテール側にある)
+    pts.push({x:c.x+HEAD.r*.7, y:c.y+HEAD.r*1.25});
+    pts.push({x:c.x+HEAD.r*.28,y:c.y+HEAD.r*1.05});
+    pts.push({x:c.x,           y:c.y+HEAD.r*1.28});
+    pts.push({x:c.x-HEAD.r*.28,y:c.y+HEAD.r*1.05});
+    pts.push({x:c.x-HEAD.r*.7, y:c.y+HEAD.r*1.25});
+    smoothPath(pts); fillStroke(behind? PAL.hairShade : PAL.hair, 2.5);
+    if(!behind){
+      ctx.save(); smoothPath(pts); ctx.clip();
+      ctx.beginPath();
+      ctx.ellipse(c.x, c.y-HEAD.r*.4, HEAD.r*.62, 9, 0, 0, 7);
+      ctx.strokeStyle=PAL.hairHi; ctx.lineWidth=6; ctx.globalAlpha=.7; ctx.stroke();
+      ctx.globalAlpha=1; ctx.restore();
+    }
+  });
+
+// ============================================================
+// ツインテール(左右)。原画: 高め結び・膝上まで・毛先ウェーブ
+// ============================================================
+function twintailSpine(side){
+  const base = onHead(side*112, 35, 1.02);
+  const sway = Math.sin(state.t*1.6 + side)*7 + Math.sin(state.t*2.7)*3;
+  const n = 10, pts=[];
+  for(let i=0;i<n;i++){
+    const u = i/(n-1);
+    const droop = u*u*260 + u*60;
+    const wave = Math.sin(u*9 + side*2)*7*u*u;    // 毛先ほど強いウェーブ
+    // ハの字に外へ流れ、毛先はやや内へ戻る
+    const out  = 12 + 62*u - 34*u*u;
+    pts.push([ base[0] + side*out + wave*side + sway*u*side*.35,
+               base[1] + 6 - droop,
+               base[2] - 12 - u*20 + sway*u*.4 ]);
+  }
+  return pts;
+}
+const TT_W = [10,14,16,17,16,14,12,9,6,2];
+for(const side of [1,-1]){
+  addPart("twintail"+(side>0?"R":"L"),
+    () => { const s=twintailSpine(side);
+      return s.map(p=>view(p)[2]).reduce((a,b)=>a+b)/s.length; },
+    () => {
+      drawRibbon(twintailSpine(side), TT_W, PAL.hair, PAL.hairShade);
+      // 天使の輪ハイライト(上部)
+      const s = twintailSpine(side).slice(1,5);
+      const {outline} = ribbonOutline(s, [7,9,10,8]);
+      smoothPath(outline); ctx.fillStyle=PAL.hairHi; ctx.globalAlpha=.55;
+      ctx.fill(); ctx.globalAlpha=1;
+    });
+}
+
+// ============================================================
+// 脚(スカートより奥)。ニーソ+絶対領域+ブーツ
+// ============================================================
+function skirtDepth(){ return bodyView([0,-130,0],LAG_BODY)[2] + 2; }
+addPart("legs",
+  () => skirtDepth() - 5,
+  () => {
+    const pf = p => bodyProj(p, LAG_LEGS);
+    for(const s of [-1,1]){
+      const hipX = s*15;
+      // 素肌の腿(スカート裾〜ニーソ上端)
+      drawRibbon([[hipX,-140,0],[hipX,-175,0],[hipX,-205,0]],
+        [14,13.5,13], PAL.skin, PAL.skinShade, pf);
+      // ニーソ(-200〜足首)
+      drawRibbon([[hipX,-200,0],[hipX+s*1,-255,0],[hipX,-300,0],[hipX,-334,0]],
+        [13.6,12,10.5,9.5], PAL.stocking, null, pf);
+      // ニーソ上端の締まり
+      const t = pf([hipX,-201,0]);
+      ctx.beginPath(); ctx.ellipse(t.x, t.y, 13.8, 3.4, 0, 0, 7);
+      ctx.fillStyle=PAL.stocking; ctx.fill();
+      // ブーツ
+      const b = pf([hipX,-334,0]);
+      const bootPts=[
+        {x:b.x-11, y:b.y-14},{x:b.x+11,y:b.y-14},
+        {x:b.x+12, y:b.y+18},{x:b.x+16,y:b.y+26},{x:b.x+15,y:b.y+32},
+        {x:b.x-12, y:b.y+32},{x:b.x-13,y:b.y+18}];
+      smoothPath(bootPts); fillStroke(PAL.boot, 2.5);
+      // 緑ソール
+      path([{x:b.x-13,y:b.y+27},{x:b.x+16,y:b.y+27},
+            {x:b.x+16,y:b.y+33},{x:b.x-13,y:b.y+33}]);
+      fillStroke(PAL.bootSole, 2);
+      // 編み上げ
+      ctx.strokeStyle=PAL.lace; ctx.lineWidth=1.6;
+      for(let k=0;k<3;k++){
+        ctx.beginPath();
+        ctx.moveTo(b.x-6, b.y-10+k*8); ctx.lineTo(b.x+6, b.y-6+k*8);
+        ctx.moveTo(b.x+6, b.y-10+k*8); ctx.lineTo(b.x-6, b.y-6+k*8);
+        ctx.stroke();
+      }
+    }
+  });
+
+// ============================================================
+// スカート(緑プリーツ、裾ジグザグ)
+// ============================================================
+addPart("skirt",
+  () => skirtDepth(),
+  () => {
+    const pf = p => bodyProj(p, LAG_BODY);
+    const yawS = Math.sin(bodyYawRad(LAG_BODY));
+    const wf = 1 - 0.3*Math.abs(yawS);
+    const c = pf([0,-98,0]);
+    const waist = 27*wf, hem = 52*wf, top = c.y, bot = CY+162;
+    const pts=[{x:c.x-waist, y:top}];
+    // 左辺→裾ジグザグ→右辺
+    pts.push({x:c.x-hem*.92, y:bot-16});
+    const nz = 8;
+    for(let i=0;i<=nz;i++){
+      const u=i/nz;
+      const x = c.x - hem + u*2*hem;
+      const dip = (i%2===0)? 10 : 0;
+      pts.push({x, y:bot-6+dip - Math.pow(Math.abs(u-0.5)*2,2)*8});
+    }
+    pts.push({x:c.x+hem*.92, y:bot-16});
+    pts.push({x:c.x+waist, y:top});
+    smoothPath(pts); fillStroke(PAL.skirt, 2.5);
+    // プリーツ(腰から裾へ放射する陰影線)
+    ctx.save(); smoothPath(pts); ctx.clip();
+    ctx.strokeStyle=PAL.skirtShade; ctx.lineWidth=2.5; ctx.globalAlpha=.75;
+    for(let i=0;i<=nz;i++){
+      const u=i/nz;
+      ctx.beginPath();
+      ctx.moveTo(c.x + (u-0.5)*2*waist*.96, top+4);
+      ctx.lineTo(c.x + (u-0.5)*2*hem*.97, bot);
+      ctx.stroke();
+    }
+    // 裾の陰影帯
+    ctx.globalAlpha=.3; ctx.fillStyle=PAL.skirtShade;
+    ctx.fillRect(c.x-hem, bot-22, hem*2, 22);
+    ctx.restore(); ctx.globalAlpha=1;
+  });
+
+// ============================================================
+// マフラーの後ろ垂れ(背中側、体より奥)
+// ============================================================
+addPart("scarfBack",
+  () => bodyView([14,-50,-16],LAG_BODY)[2],
+  () => {
+    const pf = p => bodyProj(p, LAG_BODY);
+    drawRibbon([[15,-4,-16],[20,-42,-16],[17,-88,-15],[21,-108,-14]],
+      [8,10,11,9], PAL.scarf, PAL.scarfShade, pf);
+  });
+
+// ============================================================
+// 胴体(黒チェックのオフショルニット)+露出した肩・胸元
+// ============================================================
+addPart("torso",
+  () => skirtDepth() + 2,
+  () => {
+    const pf = p => bodyProj(p, LAG_BODY);
+    const yawS = Math.sin(bodyYawRad(LAG_BODY));
+    const wf = 1 - 0.3*Math.abs(yawS);
+    const c = pf([0,0,0]);
+    // 露出した肩・鎖骨(オフショルダーで見える素肌)
+    const sh=[{x:c.x-38*wf,y:c.y+22},{x:c.x-32*wf,y:c.y+6},
+              {x:c.x-12*wf,y:c.y-2},{x:c.x+12*wf,y:c.y-2},
+              {x:c.x+32*wf,y:c.y+6},{x:c.x+38*wf,y:c.y+22},
+              {x:c.x+20*wf,y:c.y+40},{x:c.x-20*wf,y:c.y+40}];
+    smoothPath(sh); fillStroke(PAL.skin, 2.5);
+    // ニット本体(肩を出す深い襟ぐり)
+    const bd=[{x:c.x-36*wf,y:c.y+32},{x:c.x-20*wf,y:c.y+42},
+              {x:c.x,      y:c.y+46},{x:c.x+20*wf,y:c.y+42},
+              {x:c.x+36*wf,y:c.y+32},
+              {x:c.x+30*wf,y:c.y+58},{x:c.x+26*wf,y:c.y+86},
+              {x:c.x+31*wf,y:c.y+104},
+              {x:c.x,      y:c.y+110},
+              {x:c.x-31*wf,y:c.y+104},
+              {x:c.x-26*wf,y:c.y+86},{x:c.x-30*wf,y:c.y+58}];
+    smoothPath(bd); fillStroke(PAL.sweater, 2.5);
+    // チェック柄(クリップして格子)
+    ctx.save(); smoothPath(bd); ctx.clip();
+    ctx.lineWidth=1.4;
+    ctx.strokeStyle=PAL.sweaterLine;
+    for(let x=-40;x<=40;x+=16){
+      ctx.beginPath(); ctx.moveTo(c.x+x*wf, c.y+18); ctx.lineTo(c.x+x*wf*.9, c.y+112); ctx.stroke();
+    }
+    for(let y=30;y<=110;y+=15){
+      ctx.beginPath(); ctx.moveTo(c.x-40*wf, c.y+y); ctx.lineTo(c.x+40*wf, c.y+y); ctx.stroke();
+    }
+    ctx.strokeStyle=PAL.sweaterLine2; ctx.lineWidth=3;
+    for(let x=-32;x<=32;x+=16){
+      ctx.beginPath(); ctx.moveTo(c.x+(x+8)*wf, c.y+18); ctx.lineTo(c.x+(x+8)*wf*.9, c.y+112); ctx.stroke();
+    }
+    // 襟ぐりの白い縁取り
+    ctx.strokeStyle="rgba(235,235,230,.9)"; ctx.lineWidth=2.5;
+    ctx.beginPath();
+    ctx.moveTo(c.x-36*wf, c.y+32);
+    ctx.quadraticCurveTo(c.x, c.y+52, c.x+36*wf, c.y+32);
+    ctx.stroke();
+    ctx.restore();
+  });
+
+// ============================================================
+// 腕(ニット袖、下ろしたポーズ)+手
+// ============================================================
+for(const s of [-1,1]){
+  addPart("arm"+(s>0?"R":"L"),
+    () => bodyView([s*38,-60,4],LAG_BODY)[2],
+    () => {
+      const pf = p => bodyProj(p, LAG_BODY);
+      const spine = [[s*33,-16,4],[s*40,-62,5],[s*37,-108,6]];
+      drawRibbon(spine, [10,9,7.5], PAL.sweater, "rgba(0,0,0,.35)", pf);
+      const hp = pf(spine[2]);
+      if(Math.cos(state.yaw*DEG) > -0.25){
+        ctx.beginPath(); ctx.arc(hp.x, hp.y+8, 6.5, 0, 7);
+        fillStroke(PAL.skin, 2);
+      }
+    });
+}
+
+// ============================================================
+// 首+マフラー(首周りの輪)+前垂れ
+// ============================================================
+addPart("neck",
+  () => view([0,20,0])[2]-1,
+  () => {
+    const a = proj([0,26,-2]), b = proj([0,-2,-2]);
+    ctx.beginPath();
+    ctx.moveTo(a.x-8,a.y); ctx.lineTo(b.x-9,b.y);
+    ctx.lineTo(b.x+9,b.y); ctx.lineTo(a.x+8,a.y); ctx.closePath();
+    fillStroke(PAL.skinShade, 2.5);
+  });
+addPart("scarfRing",
+  () => view([0,6,14])[2],
+  () => {
+    const c = proj([0,-3,0]);
+    ctx.beginPath(); ctx.ellipse(c.x, c.y, 21, 11, 0, 0, 7);
+    fillStroke(PAL.scarf, 2.5);
+    // 巻きの筋
+    ctx.strokeStyle=PAL.scarfShade; ctx.lineWidth=2;
+    for(const k of [-1,0.2,1.4]){
+      ctx.beginPath();
+      ctx.ellipse(c.x, c.y+k*3, 22-Math.abs(k)*3, 10-Math.abs(k)*2, 0, Math.PI*1.15, Math.PI*1.85);
+      ctx.stroke();
+    }
+  });
+addPart("scarfFront",
+  () => bodyView([-10,-40,15],LAG_BODY)[2],
+  () => {
+    // 横〜後ろでは前垂れは見えない(原画の横視では垂れは背中側)
+    if(Math.abs(state.yaw) > 70) return;
+    ctx.globalAlpha = Math.min(1, (70-Math.abs(state.yaw))/15);
+    const pf = p => bodyProj(p, LAG_BODY);
+    drawRibbon([[-13,-8,15],[-17,-36,14],[-13,-64,13],[-17,-82,12]],
+      [6,8,8.5,7], PAL.scarf, PAL.scarfShade, pf);
+    ctx.globalAlpha = 1;
+    // 毛先のフリンジ
+    const e = pf([-17,-84,12]);
+    ctx.strokeStyle=PAL.scarfShade; ctx.lineWidth=2;
+    for(let k=-1;k<=1;k++){
+      ctx.beginPath(); ctx.moveTo(e.x+k*5, e.y+2); ctx.lineTo(e.x+k*6, e.y+9); ctx.stroke();
+    }
+  });
+
+// ============================================================
+// 頭部(球)
+// ============================================================
+addPart("head",
+  () => view(HEAD.c)[2],
+  () => {
+    const c = proj(HEAD.c);
+    ctx.beginPath();
+    // 頬がわずかに膨らむ輪郭(下半分を少し広げた円)
+    ctx.ellipse(c.x, c.y+2, HEAD.r*1.0, HEAD.r*1.04, 0, 0, 7);
+    fillStroke(PAL.skin, 2.8);
+    ctx.save();
+    ctx.beginPath(); ctx.ellipse(c.x, c.y+2, HEAD.r, HEAD.r*1.04, 0, 0, 7); ctx.clip();
+    ctx.beginPath(); ctx.arc(c.x-9, c.y-7, HEAD.r*1.04, 0, 7);
+    ctx.rect(-W,-H,3*W,3*H);
+    ctx.fillStyle=PAL.skinShade; ctx.globalAlpha=.35;
+    ctx.fill("evenodd");
+    ctx.restore(); ctx.globalAlpha=1;
+  });
+
+// ============================================================
+// サイドロック(顔横の長い毛束、胸元まで)
+// ============================================================
+for(const s of [1,-1]){
+  addPart("sidelock"+(s>0?"R":"L"),
+    () => view(onHead(s*62, -6))[2]+2,
+    () => {
+      const base = onHead(s*58, 10, 1.0);
+      const sway = Math.sin(state.t*1.9+s)*3;
+      const spine=[ base,
+        [base[0]+s*6, base[1]-38, base[2]+6],
+        [base[0]+s*4+sway, base[1]-80, base[2]+10],
+        [base[0]+s*9+sway, base[1]-112, base[2]+10]];
+      drawRibbon(spine, [9,8,7,2.5], PAL.hair, PAL.hairShade);
+    });
+}
+
+// ============================================================
+// 前髪(センター分け寄りの流し前髪+ジグザグ毛先)
+// ============================================================
+addPart("frontHair",
+  () => view(onHead(0,30))[2]+3,
+  () => {
+    const c = proj(HEAD.c);
+    const anchor = proj(onHead(0, 42, 1.02));
+    const f = facing(0,30);
+    if(f < -0.35) return;
+    const spreadX = HEAD.r*1.1, topY = c.y - HEAD.r*1.08;
+    const ax = (anchor.x-c.x);
+    const fringe=[];
+    const n=8;
+    for(let i=0;i<=n;i++){
+      const u=i/n, x = c.x + (u-0.5)*2*spreadX*0.95;
+      // 分け目(中央やや左)から流れる長短の毛先
+      const dip = (i%2===0)? 20 : 6;
+      const flow = Math.sin((u-0.4)*2.5)*6;
+      fringe.push({x:x + ax*.35, y: c.y - 21 + dip + flow - Math.abs(u-0.5)*-10});
+    }
+    const pts = [{x:c.x-spreadX + ax*.3, y:c.y+8},
+                 {x:c.x-spreadX*.98 + ax*.32, y:topY+30}];
+    pts.push({x:c.x + ax*.4, y:topY-2});
+    pts.push({x:c.x+spreadX*.98 + ax*.32, y:topY+30});
+    pts.push({x:c.x+spreadX + ax*.3, y:c.y+8});
+    for(let i=fringe.length-1;i>=0;i--) pts.push(fringe[i]);
+    smoothPath(pts); fillStroke(PAL.hair, 2.8);
+    // ハイライト(天使の輪)
+    ctx.save(); smoothPath(pts); ctx.clip();
+    ctx.beginPath();
+    ctx.ellipse(c.x + ax*.4, topY+22, spreadX*.6, 9, 0, 0, 7);
+    ctx.strokeStyle=PAL.hairHi; ctx.lineWidth=6; ctx.globalAlpha=.75; ctx.stroke();
+    // 毛流れの筋
+    ctx.strokeStyle=PAL.hairShade; ctx.lineWidth=1.6; ctx.globalAlpha=.5;
+    for(const k of [-0.32,-0.1,0.14,0.36]){
+      ctx.beginPath();
+      ctx.moveTo(c.x + ax*.4 + k*spreadX*.7, topY+8);
+      ctx.quadraticCurveTo(c.x + ax*.37 + k*spreadX*1.35, c.y-24,
+                           c.x + ax*.35 + k*spreadX*1.5, c.y-6);
+      ctx.stroke();
+    }
+    ctx.restore(); ctx.globalAlpha=1;
+  });
+
+// ============================================================
+// 緑のリボン飾り(頭頂右、クローバー型)
+// ============================================================
+addPart("hairAcc",
+  () => view(onHead(38,58))[2]+5,
+  () => {
+    const f = facing(38,58);
+    if(f < -0.2) return;
+    const p = proj(onHead(38, 58, 1.06));
+    ctx.save(); ctx.translate(p.x, p.y);
+    ctx.rotate(-0.5);
+    for(const dir of [-1,1]){
+      ctx.beginPath();
+      ctx.ellipse(dir*10, -6, 11, 6, dir*0.7, 0, 7);
+      fillStroke(PAL.acc, 2);
+    }
+    ctx.beginPath(); ctx.arc(0,0,4,0,7); fillStroke(PAL.accShade, 1.5);
+    ctx.restore();
+  });
+
+// ============================================================
+// 顔カード(目・眉・口・頬)
+// ============================================================
+function faceCardPos(azi, elev){
+  const p = proj(onHead(azi, elev, 1.001));
+  const f = facing(azi, elev);
+  return {p, f};
+}
+addPart("face",
+  () => view(onHead(0,0))[2]+4,
+  () => {
+    const e = EXPR[state.expr];
+    const eyeOpen = Math.max(0.05, e.eyeOpen * (1-state.blink));
+    for(const s of [-1,1]){
+      const {p,f} = faceCardPos(s*16, -8);
+      if(f<=0.32) continue;
+      const sq = Math.max(.3, Math.min(1, f*1.2));
+      const ew = 11.5*sq, eh = 14*eyeOpen;
+      ctx.save(); ctx.translate(p.x, p.y);
+      ctx.globalAlpha = Math.min(1, (f-0.32)*6);
+      if(e.eyeCurve>0.5 && state.blink<0.5){
+        ctx.beginPath(); ctx.moveTo(-ew,3); ctx.quadraticCurveTo(0,-8,ew,3);
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=3.5; ctx.lineCap="round"; ctx.stroke();
+      } else if(eh < 3){
+        ctx.beginPath(); ctx.moveTo(-ew,0); ctx.quadraticCurveTo(0,2.5,ew,0);
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=3; ctx.lineCap="round"; ctx.stroke();
+      } else {
+        // 白目
+        ctx.beginPath(); ctx.ellipse(0,0,ew,eh,0,0,7);
+        ctx.fillStyle="#fff"; ctx.fill();
+        // 虹彩(青紫、縦長)
+        ctx.beginPath(); ctx.ellipse(0,1.5,ew*.68,eh*.85,0,0,7);
+        ctx.fillStyle=PAL.eyeIris; ctx.fill();
+        ctx.beginPath(); ctx.ellipse(0,eh*.35,ew*.55,eh*.5,0,0,7);
+        ctx.fillStyle=PAL.eyeIrisD; ctx.globalCompositeOperation="source-atop";
+        ctx.fill(); ctx.globalCompositeOperation="source-over";
+        // 瞳孔
+        ctx.beginPath(); ctx.ellipse(0,2,ew*.26,eh*.34,0,0,7);
+        ctx.fillStyle=PAL.eyeDark; ctx.fill();
+        // ハイライト
+        ctx.beginPath(); ctx.ellipse(-ew*.25,-eh*.3,ew*.2,eh*.16,0,0,7);
+        ctx.fillStyle="#fff"; ctx.fill();
+        // 上まぶた+まつ毛
+        ctx.beginPath(); ctx.moveTo(-ew-1,-eh*.5);
+        ctx.quadraticCurveTo(0,-eh*1.2, ew+1,-eh*.5);
+        ctx.strokeStyle=PAL.eyeDark; ctx.lineWidth=3.5; ctx.lineCap="round"; ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(s*(ew+1),-eh*.5);
+        ctx.lineTo(s*(ew+4),-eh*.62);
+        ctx.lineWidth=2.5; ctx.stroke();
+        // 下まぶた(うっすら)
+        ctx.beginPath(); ctx.moveTo(-ew*.7,eh*.85);
+        ctx.quadraticCurveTo(0,eh*1.05, ew*.7,eh*.85);
+        ctx.strokeStyle=PAL.skinShade; ctx.lineWidth=2; ctx.stroke();
+      }
+      // 眉(金髪に合わせた薄茶、細め)
+      const bt = e.browTilt*DEG*s, by = -Math.max(eh,10)-9 + e.browY;
+      ctx.beginPath();
+      ctx.moveTo(-ew*Math.cos(bt), by-ew*Math.sin(bt)*s*0+ew*Math.sin(bt)*-1);
+      ctx.quadraticCurveTo(0, by-4, ew*Math.cos(bt), by+ew*Math.sin(bt));
+      ctx.strokeStyle=PAL.brow; ctx.lineWidth=2.4; ctx.lineCap="round"; ctx.stroke();
+      // 頬紅
+      if(e.blush>0){
+        ctx.beginPath(); ctx.ellipse(s*2, 14, 8*sq, 3.6, 0, 0, 7);
+        ctx.fillStyle="#ffb9ad";
+        ctx.globalAlpha=Math.min(1,(f-0.32)*6)*e.blush*.55; ctx.fill();
+      }
+      ctx.restore(); ctx.globalAlpha=1;
+    }
+    // 口
+    const {p:mp, f:mf} = faceCardPos(0,-38);
+    if(mf>0.1){
+      ctx.save(); ctx.translate(mp.x, mp.y);
+      ctx.globalAlpha=Math.min(1,(mf-0.1)*4);
+      const sq = Math.max(.3, Math.min(1, mf*1.2));
+      const m = EXPR[state.expr].mouth;
+      ctx.strokeStyle=PAL.mouth; ctx.lineCap="round";
+      if(m==="open"){
+        ctx.beginPath(); ctx.ellipse(0,2,6*sq,8,0,0,7);
+        fillStroke("#8e3247", 2);
+      } else if(m==="smileBig"){
+        ctx.beginPath(); ctx.moveTo(-9*sq,-1); ctx.quadraticCurveTo(0,7,9*sq,-1);
+        ctx.lineWidth=2.8; ctx.stroke();
+      } else if(m==="frown"){
+        ctx.beginPath(); ctx.moveTo(-6*sq,3); ctx.quadraticCurveTo(0,-2,6*sq,3);
+        ctx.lineWidth=2.8; ctx.stroke();
+      } else { // smile(neutralの微笑)
+        ctx.beginPath(); ctx.moveTo(-5.5*sq,0); ctx.quadraticCurveTo(0,3.5,5.5*sq,0);
+        ctx.lineWidth=2.4; ctx.stroke();
+      }
+      ctx.restore(); ctx.globalAlpha=1;
+    }
+  });
+
+// ============================================================
+// メインループ
+// ============================================================
+function frame(dt){
+  state.t += dt;
+  if(state.spinning){
+    state.yaw += dt*60;
+    if(state.yaw>180) state.yaw-=360;
+    ui.yaw.value = Math.round(state.yaw);
+  }
+  if(state.blink>0) state.blink = Math.max(0, state.blink - dt*6);
+  ui.yawv.textContent = Math.round(state.yaw)+"°";
+
+  ctx.clearRect(0,0,W,H);
+  ctx.beginPath(); ctx.ellipse(CX, CY+382, 78, 12, 0, 0, 7);
+  ctx.fillStyle="rgba(0,0,0,.12)"; ctx.fill();
+
+  const order = parts.map(p=>({p, z:p.depthFn()})).sort((a,b)=>a.z-b.z);
+  for(const {p} of order) p.drawFn();
+}
+
+const ui = {
+  yaw: document.getElementById("yaw"),
+  yawv: document.getElementById("yawv"),
+};
+ui.yaw.addEventListener("input", e=>{ state.yaw=+e.target.value; state.spinning=false;
+  document.getElementById("spin").classList.remove("on"); });
+document.getElementById("expr").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b) return;
+  state.expr = b.dataset.e;
+  for(const x of e.currentTarget.querySelectorAll("button"))
+    x.classList.toggle("on", x===b);
+});
+document.getElementById("spin").addEventListener("click", e=>{
+  state.spinning=!state.spinning;
+  e.currentTarget.classList.toggle("on", state.spinning);
+});
+document.getElementById("blink").addEventListener("click", ()=>{ state.blink=1; });
+
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.05, (now-last)/1000); last = now;
+  frame(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---- スクリーンショット検証用フック ----
+window.__setPose = (yaw, pitch, expr, t)=>{
+  state.spinning=false;
+  state.yaw=yaw??0;
+  if(expr) state.expr=expr;
+  if(t!==undefined) state.t=t;
+  frame(0);
+};
+</script>
+</body>
+</html>
